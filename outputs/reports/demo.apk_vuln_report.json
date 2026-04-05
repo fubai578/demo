@@ -1,0 +1,9 @@
+{
+    "apk_info": {
+        "name": "demo.apk",
+        "sha256": "fcc30258399b72a890c56b24b8c1edb04d83c43160db9ee85db55d5f22fb2601",
+        "size": 2220691
+    },
+    "used_libraries": [],
+    "vulnerabilities": []
+}

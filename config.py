@@ -32,7 +32,10 @@ LIBHUNTER_TPLS_JAR = DATA_DIR / "tpl_jar"
 LIBHUNTER_DIR    = BASE_DIR / "LibHunter"
 LIBHUNTER_SCRIPT = LIBHUNTER_DIR / "LibHunter.py"
 
-_LH_VENV_PYTHON = LIBHUNTER_DIR / ".venv" / "bin" / "python"
+if sys.platform == "win32":
+    _LH_VENV_PYTHON = LIBHUNTER_DIR / ".venv" / "Scripts" / "python.exe"
+else:
+    _LH_VENV_PYTHON = LIBHUNTER_DIR / ".venv" / "bin" / "python"
 PYTHON_BIN = _LH_VENV_PYTHON if _LH_VENV_PYTHON.exists() else Path(sys.executable)
 
 # ── PHunter 工具 ──────────────────────────────────────────────

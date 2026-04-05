@@ -1,13 +1,11 @@
 import re
 
-
 def valid_method_name(method_full_name):
     method_full_name = method_full_name.replace(" ", "")
     class_name = method_full_name[1:method_full_name.find(";")].replace("/",
                                                                         ".")  # com.google.android.gms.internal.bn.onPause()V
     other = method_full_name[method_full_name.find(";") + 1:]  #
     return class_name + "." + other
-
 
 def read_file_to_list(path, mode='r', encoding='utf-8'):
     lines_list = []
