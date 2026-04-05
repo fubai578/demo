@@ -20,19 +20,15 @@ DATA_DIR    = BASE_DIR / "data"
 PATCH_DIR   = DATA_DIR / "patches"
 CVE_KB_PATH = DATA_DIR / "cve_kb.json"
 
-# TPL 特征库目录（在 data/ 下，由用户自行准备）
-#   tpl_dex/  ← .dex 格式特征文件，对应 LibHunter -ld 参数
-#   tpl_jar/  ← .jar 格式特征文件，对应 LibHunter -lf 参数
-LIBHUNTER_TPLS_DEX = DATA_DIR / "tpl_dex"   # 注意：是 tpl_dex，不是 tpls_dex
+# ── 【新增】LibHunter pickle 全局缓存目录 ────────────────────
+# 使用绝对路径，切换工作目录后仍然有效
+PICKLE_CACHE_DIR = DATA_DIR / "lib_pickle_cache"
+
+# TPL 特征库目录
+LIBHUNTER_TPLS_DEX = DATA_DIR / "tpl_dex"
 LIBHUNTER_TPLS_JAR = DATA_DIR / "tpl_jar"
 
 # ── LibHunter 工具 ────────────────────────────────────────────
-# LibHunter/
-# ├── libs/        ← 工具依赖（d8.jar、android.jar 等）
-# ├── module/      ← 核心模块包
-# ├── androguard/
-# ├── dex_pickles/
-# └── LibHunter.py
 LIBHUNTER_DIR    = BASE_DIR / "LibHunter"
 LIBHUNTER_SCRIPT = LIBHUNTER_DIR / "LibHunter.py"
 
@@ -48,9 +44,19 @@ ANDROID_JAR = PHUNTER_DIR / "android-31" / "android.jar"
 JAVA_BIN = Path(shutil.which("java") or "java")
 
 # ── 超时 / 线程 ───────────────────────────────────────────────
+# 【修改】缩短超时，避免卡死服务器
 DEFAULT_PHUNTER_THREADS   = 8
-DEFAULT_LIBHUNTER_TIMEOUT = 60 * 60
-DEFAULT_PHUNTER_TIMEOUT   = 15 * 60
+DEFAULT_LIBHUNTER_TIMEOUT = 20 * 60   # 原 3600s → 20 min
+DEFAULT_PHUNTER_TIMEOUT   = 5  * 60   # 原 900s  → 5  min
+
+# 【新增】PHunter 并发限制：同时运行的 JVM 实例数上限
+MAX_PHUNTER_CONCURRENT = int(os.getenv("MAX_PHUNTER_CONCURRENT", "3"))
+
+# 【新增】相似度阈值，支持环境变量覆盖
+LIB_SIMILAR_THRESHOLD = float(os.getenv("LH_LIB_THRESHOLD", "0.85"))
+
+# 【新增】心跳超时：子进程超过此秒数无新输出则视为卡死
+SUBPROCESS_HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "60"))
 
 
 def build_pythonpath() -> str:
@@ -64,5 +70,5 @@ def build_pythonpath() -> str:
 
 def ensure_runtime_dirs() -> None:
     for path in (INPUT_DIR, OUTPUT_DIR, LOG_DIR, RAW_DIR,
-                 REPORT_DIR, DATA_DIR, PATCH_DIR):
+                 REPORT_DIR, DATA_DIR, PATCH_DIR, PICKLE_CACHE_DIR):
         path.mkdir(parents=True, exist_ok=True)

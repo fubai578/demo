@@ -1,37 +1,34 @@
-# LibHunter 操作参数配置
 import logging
 import logging.handlers
 import multiprocessing
+import os
 import os.path
+from pathlib import Path
 
-# ── 并发 ──────────────────────────────────────────────────────────────────────
-# 最大进程数，默认使用所有 CPU 核心
-# max_thread_num = multiprocessing.cpu_count()
-max_thread_num = 2  # 调试时可限制并发数
+# ── 运行参数 ──────────────────────────────────────────────────
+max_thread_num = multiprocessing.cpu_count()
 
-# ── 缓存目录 ──────────────────────────────────────────────────────────────────
-pickle_dir = "dex_pickles"
-if not os.path.exists(pickle_dir):
-    os.makedirs(pickle_dir)
+# ── 【修改】pickle 缓存目录：优先使用环境变量传入的绝对路径 ──
+# libhunter_adapter.py 在启动子进程前会通过环境变量 LH_PICKLE_DIR 传入
+# BASE_DIR / data / lib_pickle_cache，确保跨工作目录有效。
+_env_pickle_dir = os.environ.get("LH_PICKLE_DIR", "")
+if _env_pickle_dir:
+    pickle_dir = _env_pickle_dir
+else:
+    # 回退：以本文件位置推算项目根
+    _module_dir = Path(__file__).resolve().parent        # LibHunter/module/
+    _project_root = _module_dir.parent.parent            # project/
+    pickle_dir = str(_project_root / "data" / "lib_pickle_cache")
 
-# ── 检测粒度 ──────────────────────────────────────────────────────────────────
-# "lib"         = TPL 级别检测（只识别库名）
-# "lib_version" = TPL 版本级别检测（识别库名 + 版本号）
-# 默认为版本级检测，需要在 conf/lib_name_map.csv 中提供映射
+os.makedirs(pickle_dir, exist_ok=True)
+
+# 检测模式
 detect_type = "lib_version"
 
-# ── 相似度阈值 ────────────────────────────────────────────────────────────────
-# class_similar : 类级别匹配阈值（theta），1.0 = 要求完全匹配
-# method_similar: 方法级别匹配阈值，0.75 经过论文验证
 class_similar  = 1
 method_similar = 0.75
+lib_similar    = float(os.environ.get("LH_LIB_THRESHOLD", "0.85"))  # 不再硬编码 0.1
 
-# lib_similar   : 库级别匹配阈值（theta2），0.85 为论文推荐值
-# 原始代码中此变量被连续赋值两次：先 0.85，再立刻被 0.1 覆盖，导致误报率极高。
-# 修复：只保留一次赋值，使用论文推荐值 0.85。
-lib_similar = 0.85
-
-# ── 日志 ─────────────────────────────────────────────────────────────────────
 log_file = "log.txt"
 
 
@@ -45,9 +42,9 @@ def setup_logger():
     if not logger.handlers:
         if multiprocessing.current_process().name == "MainProcess":
             logger.setLevel(logging.INFO)
-            fh = logging.FileHandler(log_file, "a", encoding="utf-8")
+            fh = logging.FileHandler(log_file, 'a', encoding='utf-8')
             formatter = logging.Formatter(
-                "%(asctime)s - %(name)s - [%(lineno)d] - %(message)s"
+                '%(asctime)s - %(name)s - [%(lineno)d] - %(message)s'
             )
             fh.setFormatter(formatter)
             logger.addHandler(fh)
@@ -56,9 +53,9 @@ def setup_logger():
 
 def listener_process(queue):
     logger = logging.getLogger()
-    fh = logging.FileHandler(log_file, "a", encoding="utf-8")
+    fh = logging.FileHandler(log_file, 'a', encoding='utf-8')
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - [%(lineno)d] - %(message)s"
+        '%(asctime)s - %(name)s - [%(lineno)d] - %(message)s'
     )
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -66,7 +63,7 @@ def listener_process(queue):
 
     while True:
         record = queue.get()
-        if record is None:  # None 作为哨兵，通知监听进程退出
+        if record is None:
             break
         logger.handle(record)
 
