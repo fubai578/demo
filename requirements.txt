@@ -1,0 +1,7 @@
+# pipeline.py itself only uses the Python standard library.
+# These packages are needed so the bundled LibHunter code can run locally.
+python-Levenshtein
+networkx
+tqdm
+asn1crypto
+lxml
