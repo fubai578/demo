@@ -20,9 +20,8 @@ DATA_DIR    = BASE_DIR / "data"
 PATCH_DIR   = DATA_DIR / "patches"
 CVE_KB_PATH = DATA_DIR / "cve_kb.json"
 
-# ── 【新增】LibHunter pickle 全局缓存目录 ────────────────────
-# 使用绝对路径，切换工作目录后仍然有效
-PICKLE_CACHE_DIR = DATA_DIR / "lib_pickle_cache"
+# ── LibHunter pickle 全局缓存目录[预热] ────────────────────────────
+PICKLE_CACHE_DIR = DATA_DIR / "lib_pickles_cache"
 
 # TPL 特征库目录
 LIBHUNTER_TPLS_DEX = DATA_DIR / "tpl_dex"
@@ -60,6 +59,16 @@ LIB_SIMILAR_THRESHOLD = float(os.getenv("LH_LIB_THRESHOLD", "0.85"))
 
 # 【新增】心跳超时：子进程超过此秒数无新输出则视为卡死
 SUBPROCESS_HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "60"))
+PHUNTER_HEARTBEAT_TIMEOUT = int(os.getenv("PHUNTER_HEARTBEAT_TIMEOUT", "300"))
+
+# 【新增】LibHunter 并发与线程资源保护（可通过环境变量覆盖）
+# 经验值：4 进程在多数机器上更稳定，避免 multiprocessing.Manager 报
+# "RuntimeError: can't start new thread"
+LIBHUNTER_PROCESSES = int(os.getenv("LIBHUNTER_PROCESSES", "4"))
+
+# LibHunter 阶段常出现长时间无输出（尤其命中缓存后进入计算阶段），
+# 心跳超时单独放宽，避免误杀健康进程。
+LIBHUNTER_HEARTBEAT_TIMEOUT = int(os.getenv("LIBHUNTER_HEARTBEAT_TIMEOUT", "600"))
 
 
 def build_pythonpath() -> str:

@@ -8,17 +8,10 @@ from pathlib import Path
 # ── 运行参数 ──────────────────────────────────────────────────
 max_thread_num = multiprocessing.cpu_count()
 
-# ── 【修改】pickle 缓存目录：优先使用环境变量传入的绝对路径 ──
-# libhunter_adapter.py 在启动子进程前会通过环境变量 LH_PICKLE_DIR 传入
-# BASE_DIR / data / lib_pickle_cache，确保跨工作目录有效。
-_env_pickle_dir = os.environ.get("LH_PICKLE_DIR", "")
-if _env_pickle_dir:
-    pickle_dir = _env_pickle_dir
-else:
-    # 回退：以本文件位置推算项目根
-    _module_dir = Path(__file__).resolve().parent        # LibHunter/module/
-    _project_root = _module_dir.parent.parent            # project/
-    pickle_dir = str(_project_root / "data" / "lib_pickle_cache")
+# ── pickle 缓存目录[预热] ──
+pickle_dir = os.environ.get("LH_PICKLE_DIR", "").strip()
+if not pickle_dir:
+    raise RuntimeError("LH_PICKLE_DIR is required but not set.")
 
 os.makedirs(pickle_dir, exist_ok=True)
 

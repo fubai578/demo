@@ -18,6 +18,17 @@ filter_record_limit = 10
 abstract_method_weight = 3
 
 
+def _get_method_full_name(method: EncodedMethod) -> str:
+    """兼容不同 androguard 版本的 EncodedMethod 命名接口。"""
+    full_name = getattr(method, "full_name", None)
+    if full_name:
+        return full_name
+    try:
+        return f"{method.get_class_name()}->{method.get_name()}{method.get_descriptor()}"
+    except Exception:
+        return str(method)
+
+
 class ThirdLib(object):
 
     def __init__(self, lib_path, logger):
@@ -64,7 +75,14 @@ class ThirdLib(object):
         clz = []
         import os as _os
         _libs_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'libs')
-        with open(_os.path.join(_libs_dir, 'androidJar.txt')) as f:
+        _jar_txt = _os.environ.get("LH_ANDROID_JAR_TXT", _os.path.join(_libs_dir, 'androidJar.txt'))
+        if not _os.path.exists(_jar_txt):
+            self.LOGGER.warning(
+                "androidJar list not found: %s ; fallback to empty android class set.",
+                _jar_txt,
+            )
+            return clz
+        with open(_jar_txt, encoding="utf-8") as f:
             for line in f.readlines():
                 clz.append(line.strip())
         return clz
@@ -81,7 +99,10 @@ class ThirdLib(object):
                     graph = construct(dv_method.start_block, dv_method.var_to_name, dv_method.exceptions)
                     use_defs, _ = build_def_use(graph, dv_method.lparams)
                 except Exception as e:
-                    self.LOGGER.error('Raise an Error in method {}: {}, Skip it'.format(method.full_name, e))
+                    method_full_name = _get_method_full_name(method)
+                    self.LOGGER.error(
+                        'Raise an Error in method {}: {}, Skip it'.format(method_full_name, e)
+                    )
                     continue
                 self.analysis_callee_arguments(graph, use_defs, callsites_arguments)
         return callsites_arguments
@@ -254,8 +275,9 @@ class ThirdLib(object):
                 class_field_sigs.append(my_field_des)
 
             for method in cls.get_methods():
+                method_full_name = _get_method_full_name(method)
 
-                if method.full_name.find("<init>") != -1 or method.full_name.find("<clinit>") != -1:
+                if method_full_name.find("<init>") != -1 or method_full_name.find("<clinit>") != -1:
                     continue
                 # 忽略编译器隐式生成的函数
                 method_name_only = method.get_name()
@@ -270,7 +292,7 @@ class ThirdLib(object):
                         method_name_only.find("$serialVersionUID") != -1):  # 序列化相关
                     continue
 
-                method_name = valid_method_name(method.full_name)
+                method_name = valid_method_name(method_full_name)
 
                 method_descriptor = ""
                 method_return_sig = ""
@@ -311,7 +333,7 @@ class ThirdLib(object):
                 if method_access_flags.find("synchronized") != -1:
                     method_descriptor = "({synchronized})?" + method_descriptor
 
-                if method.full_name.find("<init>") != -1:
+                if method_full_name.find("<init>") != -1:
                     method_descriptor = "{<init>}" + method_descriptor
 
                 method_param_info = method_info[method_info.find("(") + 1:method_info.find(")")]
@@ -388,7 +410,7 @@ class ThirdLib(object):
                     class_method_sigs.append(re.compile('^' + second_method_descriptor + '$'))
 
                 method_info_list = []
-                if method.full_name.startswith("Ljava"):
+                if method_full_name.startswith("Ljava"):
                     continue
 
                 # bytecode_buff = get_bytecodes_method(dex_obj, analysis_obj, method)

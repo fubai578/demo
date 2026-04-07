@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import time
 from pathlib import Path
@@ -15,6 +16,8 @@ from config import (
     ANDROID_JAR,
     JAVA_BIN,
     LIBHUNTER_DIR,
+    LIBHUNTER_HEARTBEAT_TIMEOUT,    
+    LIBHUNTER_PROCESSES,    
     LIBHUNTER_SCRIPT,
     LIBHUNTER_TPLS_DEX,
     LIBHUNTER_TPLS_JAR,
@@ -23,6 +26,7 @@ from config import (
     PHUNTER_DIR,
     PHUNTER_JAR,
     PICKLE_CACHE_DIR,
+    PHUNTER_HEARTBEAT_TIMEOUT,  
     PYTHON_BIN,
     RAW_DIR,
     SUBPROCESS_HEARTBEAT_TIMEOUT,
@@ -47,6 +51,10 @@ _POST_SIMILARITY_PATTERN = re.compile(
     r"post\s+similarity\s*=\s*([0-9.]+)",
     re.IGNORECASE,
 )
+_PHUNTER_RESOURCE_LIMIT_PATTERN = re.compile(
+    r"(pthread_create\s+failed|unable\s+to\s+create\s+native\s+thread|EAGAIN|process/resource\s+limits\s+reached)",
+    re.IGNORECASE,
+)   
 
 
 def _write_text(path: Path, content: str) -> None:
@@ -62,6 +70,7 @@ def run_logged_command(
     env: Optional[Dict[str, str]] = None,
     stream_output: bool = True,
     heartbeat_timeout: int = SUBPROCESS_HEARTBEAT_TIMEOUT,
+    memory_limit_bytes: int = 0,
     stdout_log: Path,
     stderr_log: Path,
 ) -> CommandResult:
@@ -74,6 +83,7 @@ def run_logged_command(
         stream_output=stream_output,
         raise_on_error=False,
         heartbeat_timeout=heartbeat_timeout,
+        memory_limit_bytes=memory_limit_bytes,
     )
     _write_text(stdout_log, result.stdout)
     _write_text(stderr_log, result.stderr)
@@ -101,10 +111,11 @@ def _is_cache_valid(pkl_path: Path, source_dex: Path) -> bool:
         return False
     try:
         return pkl_path.stat().st_mtime >= source_dex.stat().st_mtime
+    # 如果 pkl 的修改时间 >= 源 dex 的修改时间，就认为缓存没过期。
     except OSError:
         return False
 
-
+# 统计并清理缓存状态
 def warm_up_cache(tpl_dex_dir: Path, cache_dir: Path) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
     dex_files = list(tpl_dex_dir.glob("*.dex"))
@@ -120,8 +131,48 @@ def warm_up_cache(tpl_dex_dir: Path, cache_dir: Path) -> dict:
             pkl.unlink(missing_ok=True)
         else:
             cached += 1
-
+    # 这个字典后面会被 run_libhunter() 使用
     return {"total": total, "cached": cached, "missing": missing, "stale": stale}
+
+# 清空目录内容但保留目录本身(为LibHunter的预热工作做准备)
+def ensure_clean_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+
+
+def prewarm_tpl_pickles(*, env: Dict[str, str], timeout: int) -> CommandResult:
+    run_root = RAW_DIR / "libhunter" / "_prewarm"
+    apk_input_dir = run_root / "apks"
+    output_dir = run_root / "outputs"
+    ensure_clean_dir(apk_input_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(PYTHON_BIN),
+        str(LIBHUNTER_SCRIPT),
+        "detect_all",
+        "-o", str(output_dir),
+        "-af", str(apk_input_dir),  # 空目录：仅触发 TPL 指纹提取与 pickle 构建
+        "-p", str(LIBHUNTER_PROCESSES), # 并行进程数
+        "-ld", str(LIBHUNTER_TPLS_DEX),
+    ]
+    if LIBHUNTER_TPLS_JAR.exists():
+        cmd.extend(["-lf", str(LIBHUNTER_TPLS_JAR)])
+    return run_logged_command(
+        cmd,
+        cwd=LIBHUNTER_DIR,
+        timeout=timeout,
+        env=env,
+        stream_output=True,
+        # 预热阶段可能长时间无输出，不应按心跳静默误判卡死
+        heartbeat_timeout=0,
+        stdout_log=LOG_DIR / "libhunter_prewarm.stdout.log",
+        stderr_log=LOG_DIR / "libhunter_prewarm.stderr.log",
+    )
 
 
 def run_libhunter(apk_path: str | Path) -> dict:
@@ -131,11 +182,29 @@ def run_libhunter(apk_path: str | Path) -> dict:
         "APK 文件": apk_path,
         "LibHunter 入口脚本": LIBHUNTER_SCRIPT,
         "TPL dex 特征库 (-ld)": LIBHUNTER_TPLS_DEX,
-        "TPL jar 源文件 (-lf)": LIBHUNTER_TPLS_JAR,
     }
     not_found = [f"  {label}: {path}" for label, path in checks.items() if not path.exists()]
     if not_found:
         raise FileNotFoundError("以下路径不存在，请检查目录结构：\n" + "\n".join(not_found))
+    if not LIBHUNTER_TPLS_JAR.exists():
+        print(
+            f"[libhunter] 提示: 未找到 tpl_jar 目录 ({LIBHUNTER_TPLS_JAR})，"
+            "将仅使用 tpl_dex 执行检测。"
+        )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = build_pythonpath()
+    env["LH_PICKLE_DIR"] = str(PICKLE_CACHE_DIR)
+    env["LH_LIB_THRESHOLD"] = str(LIB_SIMILAR_THRESHOLD)
+    env.setdefault("LH_EXEC_MODE", "mp")
+    # 限制每个进程内的 BLAS/OMP 线程，避免多进程场景下线程数爆炸。
+    # 把各种常见数值计算库线程数都限制成 1，比如 NumPy/OpenBLAS/MKL
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("NUMEXPR_NUM_THREADS", "1")
+    env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    env.setdefault("BLIS_NUM_THREADS", "1")
 
     cache_stats = warm_up_cache(LIBHUNTER_TPLS_DEX, PICKLE_CACHE_DIR)
     if cache_stats["total"] == 0:
@@ -145,8 +214,34 @@ def run_libhunter(apk_path: str | Path) -> dict:
         if miss > 0:
             print(
                 f"[libhunter] 缓存预热: {cache_stats['cached']}/{cache_stats['total']} 命中, "
-                f"{miss} 个 pkl 将在首次运行时构建（耗时较长属正常现象）。"
+                f"{miss} 个 pkl 需要构建，开始执行预热 ..."
             )
+            try:
+                prewarm_timeout = max(DEFAULT_LIBHUNTER_TIMEOUT, 2 * 60 * 60)
+                prewarm_start = time.time()
+                prewarm_result = prewarm_tpl_pickles(env=env, timeout=prewarm_timeout)
+                elapsed = time.time() - prewarm_start
+                cache_stats = warm_up_cache(LIBHUNTER_TPLS_DEX, PICKLE_CACHE_DIR)
+                remain = cache_stats["missing"] + cache_stats["stale"]
+                if prewarm_result.returncode == 0 and remain == 0:
+                    print(
+                        f"[libhunter] 预热完成: 全部 {cache_stats['total']} 个 pkl 就绪 "
+                        f"(耗时 {elapsed:.1f}s)。"
+                    )
+                elif prewarm_result.returncode == 0:
+                    print(
+                        f"[libhunter] 预热部分完成: 剩余 {remain} 个 pkl 未就绪，"
+                        "将在本轮检测中按需构建。"
+                    )
+                else:
+                    print(
+                        f"[libhunter] 预热子任务退出码={prewarm_result.returncode}，"
+                        "将继续执行检测并按需构建缓存。"
+                    )
+            except Exception as exc:
+                print(
+                    f"[libhunter] 预热失败: {exc}，将继续执行检测并按需构建缓存。"
+                )
         else:
             print(
                 f"[libhunter] 缓存预热: 全部 {cache_stats['total']} 个 pkl 命中，"
@@ -167,14 +262,11 @@ def run_libhunter(apk_path: str | Path) -> dict:
         "detect_all",
         "-o", str(output_dir),
         "-af", str(apk_input_dir),
-        "-lf", str(LIBHUNTER_TPLS_JAR),
+        "-p", str(LIBHUNTER_PROCESSES),
         "-ld", str(LIBHUNTER_TPLS_DEX),
     ]
-
-    env = os.environ.copy()
-    env["PYTHONPATH"] = build_pythonpath()
-    env["LH_PICKLE_DIR"] = str(PICKLE_CACHE_DIR)
-    env["LH_LIB_THRESHOLD"] = str(LIB_SIMILAR_THRESHOLD)
+    if LIBHUNTER_TPLS_JAR.exists():
+        cmd.extend(["-lf", str(LIBHUNTER_TPLS_JAR)])
 
     result = run_logged_command(
         cmd,
@@ -182,11 +274,12 @@ def run_libhunter(apk_path: str | Path) -> dict:
         timeout=DEFAULT_LIBHUNTER_TIMEOUT,
         env=env,
         stream_output=True,
-        heartbeat_timeout=SUBPROCESS_HEARTBEAT_TIMEOUT,
+        heartbeat_timeout=LIBHUNTER_HEARTBEAT_TIMEOUT,
         stdout_log=LOG_DIR / f"libhunter_{apk_path.stem}.stdout.log",
         stderr_log=LOG_DIR / f"libhunter_{apk_path.stem}.stderr.log",
     )
 
+    # 如果命令“卡死”
     if result.hung:
         return {
             "status": "hung",
@@ -250,6 +343,35 @@ def _parse_patch_status(text: str) -> str:
     return "UNKNOWN"
 
 
+def _is_phunter_resource_limit(text: str) -> bool:
+    return bool(_PHUNTER_RESOURCE_LIMIT_PATTERN.search(text or ""))
+
+
+def build_phunter_cmd(
+    *,
+    apk_path: Path,
+    pre_patch_jar: Path,
+    post_patch_jar: Path,
+    patch_diff: Path,
+    thread_num: int,
+    java_opts: list[str] | None = None,
+) -> list[str]:
+    cmd = [str(JAVA_BIN)]
+    if java_opts:
+        cmd.extend(java_opts)
+    cmd.extend([
+        "-jar",
+        str(PHUNTER_JAR),
+        "--preTPL", str(pre_patch_jar),
+        "--postTPL", str(post_patch_jar),
+        "--threadNum", str(thread_num),
+        "--androidJar", str(ANDROID_JAR),
+        "--patchFiles", str(patch_diff),
+        "--targetAPK", str(apk_path),
+    ])
+    return cmd
+
+
 def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
     apk_path = Path(apk_path).expanduser().resolve()
     pre_patch_jar = Path(cve_meta["pre_patch_jar"]).expanduser().resolve()
@@ -266,18 +388,17 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         raise FileNotFoundError("Missing PHunter input files: " + ", ".join(missing_paths))
 
     cve_id = cve_meta["cve_id"]
+    thread_num = int(cve_meta.get("thread_num", DEFAULT_PHUNTER_THREADS))
+    java_opts = shlex.split(os.getenv("PHUNTER_JAVA_OPTS", ""))
 
-    cmd = [
-        str(JAVA_BIN),
-        "-jar",
-        str(PHUNTER_JAR),
-        "--preTPL", str(pre_patch_jar),
-        "--postTPL", str(post_patch_jar),
-        "--threadNum", str(cve_meta.get("thread_num", DEFAULT_PHUNTER_THREADS)),
-        "--androidJar", str(ANDROID_JAR),
-        "--patchFiles", str(patch_diff),
-        "--targetAPK", str(apk_path),
-    ]
+    cmd = build_phunter_cmd(
+        apk_path=apk_path,
+        pre_patch_jar=pre_patch_jar,
+        post_patch_jar=post_patch_jar,
+        patch_diff=patch_diff,
+        thread_num=thread_num,
+        java_opts=java_opts,
+    )
 
     result = run_logged_command(
         cmd,
@@ -285,11 +406,12 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         timeout=DEFAULT_PHUNTER_TIMEOUT,
         env=None,
         stream_output=True,
-        heartbeat_timeout=SUBPROCESS_HEARTBEAT_TIMEOUT,
+        heartbeat_timeout=PHUNTER_HEARTBEAT_TIMEOUT,
         stdout_log=LOG_DIR / f"phunter_{apk_path.stem}_{cve_id}.stdout.log",
         stderr_log=LOG_DIR / f"phunter_{apk_path.stem}_{cve_id}.stderr.log",
     )
 
+    # 如果 PHunter 卡死
     if result.hung:
         return {
             "status": "hung",
@@ -306,12 +428,68 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         }
 
     combined = "\n".join(p for p in (result.stdout, result.stderr) if p)
+    retried = False
+    # 资源不足时触发重试
+    if result.returncode != 0 and _is_phunter_resource_limit(combined):
+        retried = True
+        # 降低线程数
+        retry_thread_num = max(1, min(thread_num, 2))
+        # 读取重试专用 JVM 参数
+        retry_java_opts_raw = os.getenv(
+            "PHUNTER_JAVA_RETRY_OPTS",  
+            "-Xss256k -XX:ActiveProcessorCount=2", # -Xss256k：减小线程栈大小
+            # -XX:ActiveProcessorCount=2：告诉 JVM 活跃处理器数按 2 处理
+        )
+        retry_java_opts = shlex.split(retry_java_opts_raw)
+        retry_cmd = build_phunter_cmd(
+            apk_path=apk_path,
+            pre_patch_jar=pre_patch_jar,
+            post_patch_jar=post_patch_jar,
+            patch_diff=patch_diff,
+            thread_num=retry_thread_num,
+            java_opts=retry_java_opts,
+        )
+        retry_result = run_logged_command(
+            retry_cmd,
+            cwd=PHUNTER_DIR,
+            timeout=DEFAULT_PHUNTER_TIMEOUT,
+            env=None,
+            stream_output=True,
+            heartbeat_timeout=PHUNTER_HEARTBEAT_TIMEOUT,
+            stdout_log=LOG_DIR / f"phunter_{apk_path.stem}_{cve_id}.retry.stdout.log",
+            stderr_log=LOG_DIR / f"phunter_{apk_path.stem}_{cve_id}.retry.stderr.log",
+        )
+        # 如果重试后又卡死了
+        if retry_result.hung:
+            return {
+                "status": "hung",
+                "hung": True,
+                "cve_id": cve_id,
+                "cmd": retry_result.cmd,
+                "returncode": retry_result.returncode,
+                "patch_status": "HUNG",
+                "patch_related_method_count": None,
+                "pre_similarity": None,
+                "post_similarity": None,
+                "raw_stdout": retry_result.stdout,
+                "raw_stderr": retry_result.stderr,
+                "retried": True,
+            }
+        result = retry_result
+        combined = "\n".join(p for p in (result.stdout, result.stderr) if p)
+
     patch_status = _parse_patch_status(combined)
     patch_related_method_count = _extract_int(_PATCH_METHODS_PATTERN, combined)
     pre_similarity = _extract_float(_PRE_SIMILARITY_PATTERN, combined)
     post_similarity = _extract_float(_POST_SIMILARITY_PATTERN, combined)
 
-    status = "success" if result.returncode == 0 else "failed"
+    if result.returncode == 0:
+        status = "success"
+    elif _is_phunter_resource_limit(combined):
+        status = "resource_limited"
+        patch_status = "RESOURCE_LIMIT"
+    else:
+        status = "failed"
 
     return {
         "status": status,
@@ -325,4 +503,5 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         "post_similarity": post_similarity,
         "raw_stdout": result.stdout,
         "raw_stderr": result.stderr,
+        "retried": retried,
     }

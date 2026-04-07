@@ -95,23 +95,44 @@ class AndroidVulnScanner:
     def _verify_patches(self) -> None:
         print("[*] 阶段二: 漏洞情报路由与补丁确诊 (基于 PHunter) ...")
 
-        tasks: list[tuple[TPLibrary, Vulnerability]] = [
-            (lib, vuln)
-            for lib in self.context.libraries
-            for vuln in lib.vulnerabilities
-        ]
+        grouped_tasks: dict[
+            tuple[str, str],
+            list[tuple[TPLibrary, Vulnerability]],
+        ] = {}
+        raw_task_count = 0
+        for lib in self.context.libraries:
+            for vuln in lib.vulnerabilities:
+                raw_task_count += 1
+                key = (
+                    (lib.normalized_name or "").strip().lower(),
+                    (vuln.cve_id or "").strip().upper(),
+                )
+                grouped_tasks.setdefault(key, []).append((lib, vuln))
+
+        tasks: list[tuple[TPLibrary, Vulnerability, list[tuple[TPLibrary, Vulnerability]]]] = []
+        for members in grouped_tasks.values():
+            # 同库同 CVE 仅选最高相似度候选做一次 PHunter 验证，避免重复 JVM。
+            rep_lib, rep_vuln = max(members, key=lambda item: item[0].similarity)
+            tasks.append((rep_lib, rep_vuln, members))
 
         total_vulns = len(tasks)
         if total_vulns == 0:
             print("    -> 当前组件均未命中已知 CVE 情报，无需打补丁，分析结束。")
             return
 
+        deduped = raw_task_count - total_vulns
+        if deduped > 0:
+            print(f"    -> 任务去重: {raw_task_count} -> {total_vulns}（合并 {deduped} 个重复项）")
         print(
             f"    -> 命中 {total_vulns} 个疑似漏洞记录，"
             f"并发校验（最大 {MAX_PHUNTER_CONCURRENT} 个 JVM）..."
         )
 
-        def _run_one(lib: TPLibrary, vuln: Vulnerability) -> None:
+        def _run_one(
+            lib: TPLibrary,
+            vuln: Vulnerability,
+            members: list[tuple[TPLibrary, Vulnerability]],
+        ) -> None:
             cve_meta = {
                 "cve_id": vuln.cve_id,
                 "pre_patch_jar": vuln.pre_patch_jar,
@@ -135,11 +156,27 @@ class AndroidVulnScanner:
                             vuln.cve_id, self.context.name,
                         )
                         vuln.patch_status = "HUNG"
+                        for _, member_vuln in members:
+                            member_vuln.patch_status = "HUNG"
                         return
+
+                    if patch_result.get("status") == "resource_limited":
+                        print(
+                            f"      [!] PHunter 资源受限（native thread），"
+                            f"CVE {vuln.cve_id} 标记为 RESOURCE_LIMIT。"
+                        )
+                        logger.warning(
+                            "PHunter resource limit for CVE %s / APK %s",
+                            vuln.cve_id, self.context.name,
+                        )
 
                     vuln.patch_status = patch_result.get("patch_status", "UNKNOWN")
                     vuln.pre_similarity = patch_result.get("pre_similarity")
                     vuln.post_similarity = patch_result.get("post_similarity")
+                    for _, member_vuln in members:
+                        member_vuln.patch_status = vuln.patch_status
+                        member_vuln.pre_similarity = vuln.pre_similarity
+                        member_vuln.post_similarity = vuln.post_similarity
 
                 except Exception as exc:
                     print(f"      [!] 验证过程执行出错: {exc}")
@@ -148,11 +185,13 @@ class AndroidVulnScanner:
                         vuln.cve_id, self.context.name,
                     )
                     vuln.patch_status = "ERROR"
+                    for _, member_vuln in members:
+                        member_vuln.patch_status = "ERROR"
 
         with ThreadPoolExecutor(max_workers=MAX_PHUNTER_CONCURRENT + 1) as executor:
             futures = {
-                executor.submit(_run_one, lib, vuln): (lib, vuln)
-                for lib, vuln in tasks
+                executor.submit(_run_one, lib, vuln, members): (lib, vuln)
+                for lib, vuln, members in tasks
             }
             for future in as_completed(futures):
                 try:
@@ -168,6 +207,7 @@ class AndroidVulnScanner:
         print("[*] 阶段三: 汇总诊断报告 ...")
         used_libraries: list[dict] = []
         vulnerabilities: list[dict] = []
+        seen_vuln_keys: set[tuple[str, str]] = set()
 
         for lib in self.context.libraries:
             used_libraries.append({
@@ -177,6 +217,13 @@ class AndroidVulnScanner:
                 "similarity": lib.similarity,
             })
             for vuln in lib.vulnerabilities:
+                vuln_key = (
+                    (lib.normalized_name or "").strip().lower(),
+                    (vuln.cve_id or "").strip().upper(),
+                )
+                if vuln_key in seen_vuln_keys:
+                    continue
+                seen_vuln_keys.add(vuln_key)
                 vulnerabilities.append({
                     "cve_id": vuln.cve_id,
                     "library": lib.normalized_name,
