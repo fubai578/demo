@@ -951,10 +951,168 @@ def init_worker():
         logger.removeHandler(handler)
 
 
+def _load_or_build_lib_obj(lib_dex_folder: str, lib: str, logger):
+    lib_pickle_path = os.path.join(pickle_dir, lib).replace(".dex", ".pkl")
+    try:
+        if os.path.exists(lib_pickle_path):
+            with open(lib_pickle_path, 'rb') as file:
+                return pickle.load(file)
+        lib_obj = ThirdLib(lib_dex_folder + "/" + lib, logger)
+        pickle.dump(lib_obj, open(lib_pickle_path, 'wb'))
+        return lib_obj
+    except Exception as e:
+        logger.error("Error loading/building lib %s: %s", lib, e)
+        try:
+            if os.path.exists(lib_pickle_path):
+                os.remove(lib_pickle_path)
+        except OSError:
+            pass
+        return None
+
+
+def _build_lib_pickle_task(args):
+    lib_dex_folder, lib = args
+    logger = setup_logger()
+    lib_obj = _load_or_build_lib_obj(lib_dex_folder, lib, logger)
+    return lib, lib_obj is not None
+
+
+_DETECT_APK_OBJ = None
+_DETECT_LOGGER = None
+
+
+def _init_detect_worker(apk_pickle_path: str):
+    global _DETECT_APK_OBJ, _DETECT_LOGGER
+    _DETECT_LOGGER = setup_logger()
+    with open(apk_pickle_path, 'rb') as file:
+        _DETECT_APK_OBJ = pickle.load(file)
+
+
+def _detect_one_lib_task(args):
+    lib_dex_folder, lib = args
+    logger = _DETECT_LOGGER if _DETECT_LOGGER is not None else setup_logger()
+    if _DETECT_APK_OBJ is None:
+        return None
+
+    lib_obj = _load_or_build_lib_obj(lib_dex_folder, lib, logger)
+    if lib_obj is None:
+        return None
+
+    try:
+        result = detect(_DETECT_APK_OBJ, lib_obj, logger)
+    except Exception as e:
+        logger.error("Error in detect lib %s: %s", lib, e)
+        return None
+    return result if len(result) != 0 else None
+
+
+def _search_libs_in_app_multiprocess(lib_dex_folder=None,
+                                     apk_folder=None,
+                                     output_folder='outputs',
+                                     processes=None):
+    """
+    稳定多进程模式：不使用 multiprocessing.Manager 共享大对象，
+    以“文件缓存 + 子进程返回结果”替代，避免 BrokenPipe/EOFError。
+    """
+    to_analysze_apks = os.listdir(apk_folder)
+    print("num of apk to analyze: ", len(to_analysze_apks))
+    LOGGER = setup_logger()
+
+    thread_num = processes if processes is not None else max_thread_num
+    thread_num = max(1, int(thread_num))
+    LOGGER.info("Analyzing maximum number of cpu used: %d", thread_num)
+    LOGGER.info("Multiprocess stable mode enabled (no Manager shared dict)")
+
+    LOGGER.debug("Starting to extract all library information...")
+    time_start = datetime.datetime.now()
+    libs = os.listdir(lib_dex_folder)
+    random.shuffle(libs)
+
+    decompile_thread_num = min(thread_num, len(libs)) if len(libs) > 0 else 1
+    if len(libs) > 0:
+        tasks = [(lib_dex_folder, lib) for lib in libs]
+        with Pool(processes=decompile_thread_num, initializer=init_worker) as pool:
+            # 触发所有 TPL 的 pickle 预构建/校验
+            for _ in pool.imap_unordered(_build_lib_pickle_task, tasks):
+                pass
+
+    print("All TPL information extracted ...")
+
+    time_end = datetime.datetime.now()
+    LOGGER.debug("All libraries extracted (multiprocess stable), time: %d", (time_end - time_start).seconds)
+
+    libs_list = os.listdir(lib_dex_folder)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    all_libs_num = len(libs_list)
+    LOGGER.info("The number of libraries analyzed this time is: %d", all_libs_num)
+
+    for apk in os.listdir(apk_folder):
+        print("start analyzing: ", apk)
+        LOGGER.info("Starting analysis: %s", apk)
+        apk_time_start = datetime.datetime.now()
+
+        apk_pickle_path = os.path.join(pickle_dir, apk).replace(".apk", ".pkl")
+        try:
+            if not os.path.exists(apk_pickle_path):
+                apk_obj = Apk(apk_folder + "/" + apk, LOGGER)
+                pickle.dump(apk_obj, open(apk_pickle_path, 'wb'))
+            else:
+                # 读取一次用于提前校验 pickle 是否可用
+                with open(apk_pickle_path, 'rb') as file:
+                    pickle.load(file)
+        except Exception as e:
+            LOGGER.error("Error in decompile apk: %s", e)
+            continue
+
+        global_finished_jar_dict = {}
+        if len(libs_list) > 0:
+            detect_tasks = [(lib_dex_folder, lib) for lib in libs_list]
+            with Pool(
+                processes=thread_num,
+                initializer=_init_detect_worker,
+                initargs=(apk_pickle_path,),
+            ) as pool:
+                for result in tqdm(
+                    pool.imap_unordered(_detect_one_lib_task, detect_tasks),
+                    total=len(detect_tasks),
+                    desc=apk,
+                    colour='blue',
+                ):
+                    if result:
+                        global_finished_jar_dict.update(result)
+
+        LOGGER.info("-------------------------------------------------------------------")
+        LOGGER.info("Detailed detection information for all libraries included is as follows:")
+        for lib, infos in global_finished_jar_dict.items():
+            LOGGER.info("%s  :  %f   %f   %f", lib, infos[0], infos[1], infos[2])
+        LOGGER.info("-------------------------------------------------------------------")
+
+        apk_time_end = datetime.datetime.now()
+        apk_time = (apk_time_end - apk_time_start).seconds
+        with open(output_folder + "/" + apk + ".txt", "w", encoding="utf-8") as result:
+            for lib in sorted(global_finished_jar_dict.keys()):
+                result.write("lib: " + lib + "\n")
+                result.write("similarity: " + str(global_finished_jar_dict[lib][2]) + "\n\n")
+            result.write("time: " + str(apk_time) + "s")
+
+        LOGGER.info("Current apk analysis time: %d (in seconds)", apk_time)
+
+
 def search_libs_in_app(lib_dex_folder=None,
                        apk_folder=None,
                        output_folder='outputs',
                        processes=None):
+    exec_mode = os.environ.get("LH_EXEC_MODE", "mp").lower()
+    if exec_mode != "legacy":
+        return _search_libs_in_app_multiprocess(
+            lib_dex_folder=lib_dex_folder,
+            apk_folder=apk_folder,
+            output_folder=output_folder,
+            processes=processes,
+        )
+
     to_analysze_apks = os.listdir(apk_folder)
     print("num of apk to analyze: ", len(to_analysze_apks))
     LOGGER = setup_logger()

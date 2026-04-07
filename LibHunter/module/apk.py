@@ -11,6 +11,17 @@ from util import valid_method_name, toMillisecond
 filter_record_limit = 10
 abstract_method_weight = 3 
 
+
+def _get_method_full_name(method: EncodedMethod) -> str:
+    """兼容不同 androguard 版本的 EncodedMethod 命名接口。"""
+    full_name = getattr(method, "full_name", None)
+    if full_name:
+        return full_name
+    try:
+        return f"{method.get_class_name()}->{method.get_name()}{method.get_descriptor()}"
+    except Exception:
+        return str(method)
+
 class Apk(object):
 
     def __init__(self, apk_path, logger):
@@ -52,7 +63,14 @@ class Apk(object):
         clz = []
         import os as _os
         _libs_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'libs')
-        with open(_os.path.join(_libs_dir, 'androidJar.txt')) as f:
+        _jar_txt = _os.environ.get("LH_ANDROID_JAR_TXT", _os.path.join(_libs_dir, 'androidJar.txt'))
+        if not _os.path.exists(_jar_txt):
+            self.LOGGER.warning(
+                "androidJar list not found: %s ; fallback to empty android class set.",
+                _jar_txt,
+            )
+            return clz
+        with open(_jar_txt, encoding="utf-8") as f:
             for line in f.readlines():
                 clz.append(line.strip())
         return clz
@@ -158,8 +176,9 @@ class Apk(object):
                         class_field_sigs.append(my_field_des)
 
                 for method in cls.get_methods():
+                    method_full_name = _get_method_full_name(method)
 
-                    if method.full_name.find("<init>") != -1 or method.full_name.find("<clinit>") != -1:
+                    if method_full_name.find("<init>") != -1 or method_full_name.find("<clinit>") != -1:
                         continue
                     
                     # 忽略编译器隐式生成的函数
@@ -206,7 +225,7 @@ class Apk(object):
                     if method_access_flags.find("synchronized") != -1:
                         method_descriptor = "{synchronized}" + method_descriptor
 
-                    if method.full_name.find("<init>") != -1:
+                    if method_full_name.find("<init>") != -1:
                         method_descriptor = "{<init>}" + method_descriptor
 
                     # Record method parameter types
@@ -233,11 +252,11 @@ class Apk(object):
 
                     class_method_sigs.append(method_descriptor)
 
-                    method_name = valid_method_name(method.full_name)
+                    method_name = valid_method_name(method_full_name)
 
                     method_info_list = []
 
-                    if method.full_name.startswith("Ljava"):
+                    if method_full_name.startswith("Ljava"):
                         continue
 
                     method_opcodes, method_strings = self.my_get_method_opcodes(analysis_obj, method, method_name)
