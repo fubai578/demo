@@ -48,7 +48,9 @@ def sub_method_map_decompile(lib_folder,
         os.mkdir(pickle_dir)
 
     for lib in libs:
-        lib_pickle_path = os.path.join(pickle_dir, lib).replace(".dex", ".pkl")
+        # 适配嵌套目录：将斜杠替换为下划线，避免 pickle 目录不存在报错
+        flat_lib_name = lib.replace("/", "_").replace("\\", "_")
+        lib_pickle_path = os.path.join(pickle_dir, flat_lib_name).replace(".dex", ".pkl")
         try:
             if os.path.exists(lib_pickle_path):
                 with open(lib_pickle_path, 'rb') as file:
@@ -952,7 +954,9 @@ def init_worker():
 
 
 def _load_or_build_lib_obj(lib_dex_folder: str, lib: str, logger):
-    lib_pickle_path = os.path.join(pickle_dir, lib).replace(".dex", ".pkl")
+    # 扁平化 pickle 名称以支持嵌套目录结构
+    flat_lib_name = lib.replace("/", "_").replace("\\", "_")
+    lib_pickle_path = os.path.join(pickle_dir, flat_lib_name).replace(".dex", ".pkl")
     try:
         if os.path.exists(lib_pickle_path):
             with open(lib_pickle_path, 'rb') as file:
@@ -988,6 +992,76 @@ def _init_detect_worker(apk_pickle_path: str):
         _DETECT_APK_OBJ = pickle.load(file)
 
 
+# ==========================================
+# 新增：启发式剪枝核心：基于 prematch 的探针检测任务
+# ==========================================
+def _probe_group_task(args):
+    """
+    稳定多进程模式探针：仅执行 pre_match (模糊签名及 Bloom Filter)。
+    如果匹配率低于阈值，则直接判定不包含该组件库。
+    """
+    lib_dex_folder, probe_lib, base_name = args
+    logger = _DETECT_LOGGER if _DETECT_LOGGER is not None else setup_logger()
+    if _DETECT_APK_OBJ is None:
+        return base_name, False
+
+    lib_obj = _load_or_build_lib_obj(lib_dex_folder, probe_lib, logger)
+    if lib_obj is None or len(lib_obj.classes_dict) == 0:
+        return base_name, False
+
+    # 仅执行最轻量的粗筛
+    filter_result = pre_match(_DETECT_APK_OBJ, lib_obj, logger)
+    pre_match_opcodes = 0
+    lib_classes_dict = lib_obj.classes_dict
+
+    for lib_class in filter_result:
+        if len(lib_classes_dict[lib_class]) == 2:
+            pre_match_opcodes += (len(lib_classes_dict[lib_class][0]) * abstract_method_weight)
+        else:
+            pre_match_opcodes += lib_classes_dict[lib_class][2]
+
+    lib_opcode_num = lib_obj.lib_opcode_num
+    pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0
+
+    # 探针预筛阈值，直接与 lib_similar 对齐或设为 0.25 (取小者)
+    probe_threshold = min(0.25, lib_similar)
+    is_suspected = pre_match_rate >= probe_threshold
+    
+    return base_name, is_suspected
+
+
+def sub_probe_lib_legacy(lib, apk, global_apk_info_dict, global_lib_info_dict, shared_matched_groups, base_name_mapping):
+    """
+    Legacy 模式探针：仅执行 pre_match (模糊签名及 Bloom Filter)。
+    """
+    logger = setup_logger()
+    if lib not in global_lib_info_dict:
+        return
+    lib_obj = global_lib_info_dict[lib]
+    apk_obj = global_apk_info_dict[apk]
+
+    if len(lib_obj.classes_dict) == 0:
+        return
+
+    filter_result = pre_match(apk_obj, lib_obj, logger)
+    pre_match_opcodes = 0
+    lib_classes_dict = lib_obj.classes_dict
+
+    for lib_class in filter_result:
+        if len(lib_classes_dict[lib_class]) == 2:
+            pre_match_opcodes += (len(lib_classes_dict[lib_class][0]) * abstract_method_weight)
+        else:
+            pre_match_opcodes += lib_classes_dict[lib_class][2]
+
+    lib_opcode_num = lib_obj.lib_opcode_num
+    pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0
+    probe_threshold = min(0.25, lib_similar)
+
+    if pre_match_rate >= probe_threshold:
+        base_name = base_name_mapping[lib]
+        shared_matched_groups[base_name] = True
+
+
 def _detect_one_lib_task(args):
     lib_dex_folder, lib = args
     logger = _DETECT_LOGGER if _DETECT_LOGGER is not None else setup_logger()
@@ -1013,6 +1087,7 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
     """
     稳定多进程模式：不使用 multiprocessing.Manager 共享大对象，
     以“文件缓存 + 子进程返回结果”替代，避免 BrokenPipe/EOFError。
+    并引入两阶段启发式剪枝（Prematch 探针筛选 -> 全量版本比对）。
     """
     to_analysze_apks = os.listdir(apk_folder)
     print("num of apk to analyze: ", len(to_analysze_apks))
@@ -1025,7 +1100,21 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
 
     LOGGER.debug("Starting to extract all library information...")
     time_start = datetime.datetime.now()
-    libs = os.listdir(lib_dex_folder)
+    
+    lib_groups = {}
+    libs_list = []
+    
+    # 遍历嵌套目录: data/tpl_dex/<lib_name>/<versions>.dex
+    for item in os.listdir(lib_dex_folder):
+        item_path = os.path.join(lib_dex_folder, item)
+        if os.path.isdir(item_path):
+            base_name = item
+            versions = [f"{base_name}/{f}" for f in os.listdir(item_path) if f.endswith('.dex')]
+            if versions:
+                lib_groups[base_name] = versions
+                libs_list.extend(versions)
+
+    libs = list(libs_list)  # 用于兼容后面的代码
     random.shuffle(libs)
 
     decompile_thread_num = min(thread_num, len(libs)) if len(libs) > 0 else 1
@@ -1041,7 +1130,6 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
     time_end = datetime.datetime.now()
     LOGGER.debug("All libraries extracted (multiprocess stable), time: %d", (time_end - time_start).seconds)
 
-    libs_list = os.listdir(lib_dex_folder)
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
@@ -1067,21 +1155,56 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
             continue
 
         global_finished_jar_dict = {}
+
         if len(libs_list) > 0:
-            detect_tasks = [(lib_dex_folder, lib) for lib in libs_list]
-            with Pool(
-                processes=thread_num,
-                initializer=_init_detect_worker,
-                initargs=(apk_pickle_path,),
-            ) as pool:
-                for result in tqdm(
-                    pool.imap_unordered(_detect_one_lib_task, detect_tasks),
-                    total=len(detect_tasks),
-                    desc=apk,
-                    colour='blue',
+            # ==========================================
+            # 阶段 1: 探针检测 (基于 prematch 和目录结构)
+            # ==========================================
+            probe_tasks = []
+            for base_name, versions in lib_groups.items():
+                versions.sort()
+                probe_lib = versions[-1] # 选择字典序最大的版本作为探针
+                probe_tasks.append((lib_dex_folder, probe_lib, base_name))
+
+            matched_groups = set()
+            LOGGER.info(f"[*] 开启启发式剪枝: 正在对 {len(probe_tasks)} 个组件族进行 Prematch 探针筛选...")
+
+            with Pool(processes=thread_num, initializer=_init_detect_worker, initargs=(apk_pickle_path,)) as pool:
+                for base_name, is_suspected in tqdm(
+                    pool.imap_unordered(_probe_group_task, probe_tasks),
+                    total=len(probe_tasks),
+                    desc=f"Probe {apk}",
+                    colour='yellow'
                 ):
-                    if result:
-                        global_finished_jar_dict.update(result)
+                    if is_suspected:
+                        matched_groups.add(base_name)
+
+            skipped_groups = len(lib_groups) - len(matched_groups)
+            LOGGER.info(f"[-] 探针筛选完毕: 跳过 {skipped_groups} 个无关组件族。")
+            
+            # ==========================================
+            # 阶段 2: 命中族群的全版本深度检测
+            # ==========================================
+            detect_tasks = []
+            for base_name in matched_groups:
+                for lib in lib_groups[base_name]:
+                    detect_tasks.append((lib_dex_folder, lib))
+
+            if len(detect_tasks) > 0:
+                LOGGER.info(f"[+] 发现 {len(matched_groups)} 个疑似组件族，准备对剩余 {len(detect_tasks)} 个版本进行细筛...")
+                with Pool(
+                    processes=thread_num,
+                    initializer=_init_detect_worker,
+                    initargs=(apk_pickle_path,),
+                ) as pool:
+                    for result in tqdm(
+                        pool.imap_unordered(_detect_one_lib_task, detect_tasks),
+                        total=len(detect_tasks),
+                        desc=f"Detect {apk}",
+                        colour='blue',
+                    ):
+                        if result:
+                            global_finished_jar_dict.update(result)
 
         LOGGER.info("-------------------------------------------------------------------")
         LOGGER.info("Detailed detection information for all libraries included is as follows:")
@@ -1122,8 +1245,22 @@ def search_libs_in_app(lib_dex_folder=None,
 
     LOGGER.debug("Starting to extract all library information...")
     time_start = datetime.datetime.now()
-    libs = os.listdir(lib_dex_folder)
+    
+    lib_groups = {}
+    libs_list = []
+    
+    for item in os.listdir(lib_dex_folder):
+        item_path = os.path.join(lib_dex_folder, item)
+        if os.path.isdir(item_path):
+            base_name = item
+            versions = [f"{base_name}/{f}" for f in os.listdir(item_path) if f.endswith('.dex')]
+            if versions:
+                lib_groups[base_name] = versions
+                libs_list.extend(versions)
+
+    libs = list(libs_list)
     random.shuffle(libs)
+    
     with Manager() as manager:
         log_queue1 = manager.Queue()
 
@@ -1172,9 +1309,6 @@ def search_libs_in_app(lib_dex_folder=None,
         time_end = datetime.datetime.now()
         LOGGER.debug("All libraries extracted, time: %d", (time_end - time_start).seconds)
 
-        # 载入所有dex文件并分配任务
-        libs_list = os.listdir(lib_dex_folder)
-
         finish_apks = []
         if not os.path.exists(output_folder):
             os.makedirs(output_folder)
@@ -1211,20 +1345,61 @@ def search_libs_in_app(lib_dex_folder=None,
 
             global_finished_jar_dict = manager.dict()
 
+            # ==========================================
+            # Legacy Mode: 探针预筛阶段
+            # ==========================================
+            shared_matched_groups = manager.dict()
+            probe_libs = []
+            base_name_mapping = {}
+            for base_name, versions in lib_groups.items():
+                versions.sort()
+                probe_lib = versions[-1] # 选择最新版本探针
+                probe_libs.append(probe_lib)
+                base_name_mapping[probe_lib] = base_name
+
+            LOGGER.info(f"[*] 开启启发式剪枝(Legacy): 正在对 {len(probe_libs)} 个组件族进行探针预筛...")
+
+            process_probe_partial = partial(sub_probe_lib_legacy, apk=apk, global_apk_info_dict=global_apk_info_dict,
+                                          global_lib_info_dict=global_lib_info_dict,
+                                          shared_matched_groups=shared_matched_groups,
+                                          base_name_mapping=base_name_mapping)
+            log_queue_probe = manager.Queue()
+            listener_probe = Process(target=listener_process, args=(log_queue_probe,))
+            listener_probe.start()
+            with Pool(processes=thread_num, initializer=worker_init, initargs=(log_queue_probe,)) as pool:
+                list(tqdm(pool.imap(process_probe_partial, probe_libs), total=len(probe_libs), desc=f"Probe {apk}", colour='yellow'))
+                pool.close()
+                pool.join()
+            log_queue_probe.put(None)
+            listener_probe.join()
+
+            skipped_groups = len(lib_groups) - len(shared_matched_groups)
+            LOGGER.info(f"[-] 探针筛选完毕: 跳过 {skipped_groups} 个无关组件族。")
+
+            # ==========================================
+            # Legacy Mode: 全量细筛阶段
+            # ==========================================
+            detect_libs = []
+            for base_name in shared_matched_groups.keys():
+                detect_libs.extend(lib_groups[base_name])
+
             process_lib_partial = partial(sub_detect_lib, apk=apk, global_apk_info_dict=global_apk_info_dict,
                                           global_finished_jar_dict=global_finished_jar_dict,
                                           global_lib_info_dict=global_lib_info_dict)
-            log_queue3 = manager.Queue()
-            listener3 = Process(target=listener_process, args=(log_queue3,))
-            listener3.start()
-            with Pool(processes=thread_num, initializer=worker_init, initargs=(log_queue3,)) as pool:
-                list(tqdm(pool.imap(process_lib_partial, libs_list), total=len(libs_list), desc=apk, colour='blue'))
-                pool.close()
-                pool.join()
 
-            # Stop the listener
-            log_queue3.put(None)
-            listener3.join()
+            if len(detect_libs) > 0:
+                LOGGER.info(f"[+] 准备对剩余 {len(detect_libs)} 个版本进行细筛...")
+                log_queue3 = manager.Queue()
+                listener3 = Process(target=listener_process, args=(log_queue3,))
+                listener3.start()
+                with Pool(processes=thread_num, initializer=worker_init, initargs=(log_queue3,)) as pool:
+                    list(tqdm(pool.imap(process_lib_partial, detect_libs), total=len(detect_libs), desc=f"Detect {apk}", colour='blue'))
+                    pool.close()
+                    pool.join()
+
+                # Stop the listener
+                log_queue3.put(None)
+                listener3.join()
 
 
             LOGGER.info("-------------------------------------------------------------------")
