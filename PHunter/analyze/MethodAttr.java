@@ -1,13 +1,17 @@
 package analyze;
 
 import soot.*;
+import symbolicExec.MethodDigest;
 
+import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
 
-public class MethodAttr implements Comparable<MethodAttr> {
+public class MethodAttr implements Comparable<MethodAttr>, Serializable {
+    private static final long serialVersionUID = 1L;
 
     public static final String ClassRepresentation = "X";
     public static final String ArrayClassRepresentation = "X[]";
@@ -17,14 +21,20 @@ public class MethodAttr implements Comparable<MethodAttr> {
     public int modifiers;
     public String fuzzy;
     public String subSignature;
-    public Body body;
+    public transient Body body;
+    public boolean hasBody;
+    public String returnType;
+    public List<String> parameterTypes = new ArrayList<>();
+    public MethodDigest digest;
 
     public int startLinenumber;
     public int endLinenumber;
 
-    public final List<MethodAttr> callee = new LinkedList<>();
-    public final List<MethodAttr> caller = new LinkedList<>();
-    public final Set<SootField> fieldRef = new HashSet<>();
+    public transient List<MethodAttr> callee = new LinkedList<>();
+    public transient List<MethodAttr> caller = new LinkedList<>();
+    public List<String> calleeFuzzy = new LinkedList<>();
+    public List<String> callerFuzzy = new LinkedList<>();
+    public transient Set<SootField> fieldRef = new HashSet<>();
     public List<String> fuzzyFieldRef = null;
 
     //    private final Set<String> readField = new HashSet<>();
@@ -52,6 +62,11 @@ public class MethodAttr implements Comparable<MethodAttr> {
         fuzzy = getFuzzyForm(method);
         modifiers = method.getModifiers();
         subSignature = method.getSubSignature();
+        hasBody = true;
+        returnType = method.getReturnType().toString();
+        for (Type t : method.getParameterTypes()) {
+            parameterTypes.add(t.toString());
+        }
     }
 
     public MethodAttr(SootMethod method) { // for no body method
@@ -59,6 +74,26 @@ public class MethodAttr implements Comparable<MethodAttr> {
         fuzzy = getFuzzyForm(method);
         modifiers = method.getModifiers();
         subSignature = method.getSubSignature();
+        hasBody = method.hasActiveBody();
+        returnType = method.getReturnType().toString();
+        for (Type t : method.getParameterTypes()) {
+            parameterTypes.add(t.toString());
+        }
+    }
+
+    public boolean hasActiveBody() {
+        return hasBody || digest != null;
+    }
+
+    public MethodDigest ensureDigest(List<Integer> patchRelatedLines) {
+        if (digest != null) {
+            return digest;
+        }
+        if (body == null) {
+            return null;
+        }
+        digest = new MethodDigest(body, patchRelatedLines);
+        return digest;
     }
 
 
@@ -67,6 +102,10 @@ public class MethodAttr implements Comparable<MethodAttr> {
             return;
         this.fuzzyFieldRef = new LinkedList<>();
         for (SootField f : fieldRef) {
+            if (f == null) {
+                fuzzyFieldRef.add("java.lang.Object,");
+                continue;
+            }
             StringBuilder sb = new StringBuilder();
             addType(f.getType(), sb);
             fuzzyFieldRef.add(sb.toString());
@@ -87,34 +126,57 @@ public class MethodAttr implements Comparable<MethodAttr> {
     }
 
     private void addType(Type t, StringBuilder sb) {
-        if (t instanceof RefType) {
-            RefType refType = (RefType) t;
-            if (refType.getSootClass().isJavaLibraryClass()
-                    || isAndroidClass(refType.getSootClass().getName()))
-                sb.append(t).append(",");
-            else if (refType.getSootClass().isApplicationClass()
-                    || refType.getSootClass().isPhantomClass()) {
-                sb.append("X,");
-            } else {
-                sb.append(t).append(",");
-            }
+        if (t == null) {
+            sb.append("java.lang.Object,");
             return;
         }
-        if (t instanceof ArrayType &&
-                ((ArrayType) t).baseType instanceof RefType) {
-            RefType refType = (RefType) ((ArrayType) t).baseType;
-            if (refType.getSootClass().isJavaLibraryClass()
-                    || isAndroidClass(refType.getSootClass().getName()))
-                sb.append(t).append(",");
-            else if (refType.getSootClass().isApplicationClass()
-                    || refType.getSootClass().isPhantomClass()) {
-                sb.append("X[],");
-            } else {
-                sb.append(t).append(",");
+        try {
+            if (t instanceof RefType) {
+                RefType refType = (RefType) t;
+                SootClass sootClass = resolveSootClass(refType);
+                if (sootClass == null) {
+                    sb.append(t).append(",");
+                } else if (sootClass.isJavaLibraryClass()
+                        || isAndroidClass(sootClass.getName())) {
+                    sb.append(t).append(",");
+                } else if (sootClass.isApplicationClass()
+                        || sootClass.isPhantomClass()) {
+                    sb.append("X,");
+                } else {
+                    sb.append(t).append(",");
+                }
+                return;
             }
-            return;
+            if (t instanceof ArrayType &&
+                    ((ArrayType) t).baseType instanceof RefType) {
+                RefType refType = (RefType) ((ArrayType) t).baseType;
+                SootClass sootClass = resolveSootClass(refType);
+                if (sootClass == null) {
+                    sb.append(t).append(",");
+                } else if (sootClass.isJavaLibraryClass()
+                        || isAndroidClass(sootClass.getName())) {
+                    sb.append(t).append(",");
+                } else if (sootClass.isApplicationClass()
+                        || sootClass.isPhantomClass()) {
+                    sb.append("X[],");
+                } else {
+                    sb.append(t).append(",");
+                }
+                return;
+            }
+            sb.append(t).append(",");
+        } catch (RuntimeException ex) {
+            // Some libraries contain broken/phantom type metadata. Fall back to raw type text.
+            sb.append(t).append(",");
         }
-        sb.append(t).append(",");
+    }
+
+    private SootClass resolveSootClass(RefType refType) {
+        try {
+            return refType.getSootClass();
+        } catch (RuntimeException ex) {
+            return null;
+        }
     }
 
 
@@ -128,11 +190,23 @@ public class MethodAttr implements Comparable<MethodAttr> {
 
 
     public void addCallee(MethodAttr callee) {
+        if (this.callee == null) {
+            this.callee = new LinkedList<>();
+        }
         this.callee.add(callee);
+        if (callee != null && callee.fuzzy != null) {
+            this.calleeFuzzy.add(callee.fuzzy);
+        }
     }
 
     public void addCaller(MethodAttr caller) {
+        if (this.caller == null) {
+            this.caller = new LinkedList<>();
+        }
         this.caller.add(caller);
+        if (caller != null && caller.fuzzy != null) {
+            this.callerFuzzy.add(caller.fuzzy);
+        }
     }
 
     public static boolean isAndroidClass(String name) {

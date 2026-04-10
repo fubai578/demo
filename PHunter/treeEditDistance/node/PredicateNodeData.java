@@ -6,7 +6,10 @@ import soot.Value;
 import soot.jimple.*;
 import treeEditDistance.costmodel.NodeType;
 
-public class PredicateNodeData {
+import java.io.Serializable;
+
+public class PredicateNodeData implements Serializable {
+    private static final long serialVersionUID = 1L;
     /* Field = type. eg, int, some_class
         Constant = type#value. eg, int#2, string#abcde
         Comparator = <, <=, ==, !=
@@ -18,7 +21,7 @@ public class PredicateNodeData {
 
     private String data;
 
-    private Value value = null;
+    private transient Value value = null;
 
     public void setNodeType(NodeType nodeType) {
         this.nodeType = nodeType;
@@ -71,12 +74,20 @@ public class PredicateNodeData {
             setNodeType(NodeType.CaughtException);
             setData("@caughtexception");
         } else if (v instanceof FieldRef) {
-            SootField field = ((FieldRef) v).getField();
-            StringBuilder fieldSb = new StringBuilder();
-            fieldSb.append(field.getDeclaringClass().getName()).append("#");
             setNodeType(NodeType.Field);
-            fieldSb.append(field.getType());
-            setData(fieldSb.toString());
+            try {
+                SootField field = ((FieldRef) v).getField();
+                if (field == null || field.getDeclaringClass() == null || field.getType() == null) {
+                    setData("java.lang.Object#java.lang.Object");
+                } else {
+                    StringBuilder fieldSb = new StringBuilder();
+                    fieldSb.append(field.getDeclaringClass().getName()).append("#");
+                    fieldSb.append(field.getType());
+                    setData(fieldSb.toString());
+                }
+            } catch (RuntimeException ex) {
+                setData("java.lang.Object#java.lang.Object");
+            }
         } else if (v instanceof ParameterRef) {
             int index = ((ParameterRef) v).getIndex();
             setNodeType(NodeType.Parameter);

@@ -10,6 +10,9 @@ import soot.options.Options;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Hello world!
@@ -28,45 +31,98 @@ public class BinaryAnalyzer extends Analyzer {
         super(config);
         this.isPre = isPre;
         this.config = config;
+        String inputPath = isPre ? config.getPreBinary() : config.getPostBinary();
+        File inputFile = new File(inputPath);
+
+        Map<String, ClassAttr> cachedClasses = AnalyzerCacheSupport.tryLoadAnalyzer(
+                config, "binary_analysis", inputFile, logger);
+        if (cachedClasses != null) {
+            this.allClasses = cachedClasses;
+            rebuildAllMethodsFromClasses();
+            return;
+        }
+
         SootCallGraph cg = analyze(isPre);
         buildCG(cg);
+        AnalyzerCacheSupport.storeAnalyzer(config, "binary_analysis", inputFile, this.allClasses, logger);
     }
 
-    private void initializeSoot() {
+    private void initializeSoot(boolean useCachedArtifacts) {
         G.reset();
         Options.v().set_whole_program(true);
-        Options.v().set_src_prec(soot.options.Options.src_prec_only_class);
+        if (useCachedArtifacts) {
+            Options.v().set_src_prec(Options.src_prec_only_class);
+        } else {
+            Options.v().set_src_prec(soot.options.Options.src_prec_only_class);
+        }
         Options.v().set_output_format(soot.options.Options.output_format_n);
         Options.v().set_allow_phantom_refs(true);
 
     }
 
     private SootCallGraph analyze(boolean isPre) throws IOException {
-        initializeSoot();
-        SootCallGraph cg = new SootCallGraph(false);
         String inputPath;
         if (isPre) {
             inputPath = config.getPreBinary();
-            PackManager.v().getPack("jtp").add(new Transform("jtp.pre", new CallGraphTransform(cg)));
             logger.info(String.format("Analyzing the pre-patched binary %s", config.getPreBinary()));
         } else {
             inputPath = config.getPostBinary();
-            PackManager.v().getPack("jtp").add(new Transform("jtp.post", new CallGraphTransform(cg)));
             logger.info(String.format("Analyzing the post-patched binary %s", config.getPostBinary()));
         }
         // analyze the pre-patch binary
         File inputFile = new File(inputPath);
-        String sootOutDir = "tmp" + File.separator +
-                inputFile.getName().substring(0, inputFile.getName().indexOf(".jar"));
-        String[] sootArgs = new String[]{
-                "-keep-line-number",
-                "-p", "jb", "use-original-names:true",
-                "-process-dir",
-                inputFile.getCanonicalPath(),
-//                "-d",
-//                sootOutDir,
-        };
-        Main.main(sootArgs);
+        File cacheEntry = null;
+        boolean useCachedArtifacts = false;
+        boolean enableSootArtifactCache = SootCacheSupport.isCacheEnabled(config) && !config.isAnalysisCacheOnly();
+        if (enableSootArtifactCache) {
+            cacheEntry = SootCacheSupport.getEntryDir(config, "binary", inputFile);
+            if (SootCacheSupport.isReady(cacheEntry)) {
+                useCachedArtifacts = true;
+                logger.info("Using cached binary Soot artifacts for {}", inputPath);
+            } else {
+                File aliasEntry = SootCacheSupport.getAliasEntryDirIfReady(config, "binary", inputFile);
+                if (aliasEntry != null) {
+                    cacheEntry = aliasEntry;
+                    useCachedArtifacts = true;
+                    logger.info("Using alias-mapped binary cache for {}", inputFile.getName());
+                }
+            }
+        }
+
+        initializeSoot(useCachedArtifacts);
+        SootCallGraph cg = new SootCallGraph(false);
+        if (isPre) {
+            PackManager.v().getPack("jtp").add(new Transform("jtp.pre", new CallGraphTransform(cg)));
+        } else {
+            PackManager.v().getPack("jtp").add(new Transform("jtp.post", new CallGraphTransform(cg)));
+        }
+        List<String> sootArgs = new ArrayList<>();
+        sootArgs.add("-keep-line-number");
+        // Some libraries trigger Soot body retrieval crashes with use-original-names:true.
+        // Keep default name handling for robustness during large-scale prewarm.
+        sootArgs.add("-process-dir");
+        if (useCachedArtifacts) {
+            sootArgs.add(SootCacheSupport.getJimpleDir(cacheEntry).getCanonicalPath());
+        } else {
+            sootArgs.add(inputFile.getCanonicalPath());
+            if (cacheEntry != null && SootCacheSupport.isReadWrite(config)) {
+                SootCacheSupport.prepareJimpleOutputDir(cacheEntry);
+                Options.v().set_output_format(Options.output_format_class);
+                Options.v().set_output_dir(SootCacheSupport.getJimpleDir(cacheEntry).getCanonicalPath());
+            }
+        }
+
+        Main.main(sootArgs.toArray(new String[0]));
+        if (!useCachedArtifacts && cacheEntry != null && SootCacheSupport.isReadWrite(config)) {
+            SootCacheSupport.markReady(
+                    cacheEntry,
+                    "source=" + inputFile.getCanonicalPath() + "\n"
+                            + "name=" + inputFile.getName() + "\n"
+                            + "size=" + inputFile.length() + "\n"
+                            + "mtime=" + inputFile.lastModified() + "\n"
+            );
+            SootCacheSupport.registerAlias(config, "binary", inputFile, cacheEntry);
+        }
         cg.buildSootCallGraph();
         return cg;
     }

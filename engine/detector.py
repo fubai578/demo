@@ -1,7 +1,9 @@
 """LibHunter / PHunter 外部工具调用：统一日志、工作目录与 subprocess 行为。"""
 from __future__ import annotations
 
+import hashlib
 import os
+import json
 import re
 import shlex
 import shutil
@@ -10,6 +12,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from config import (
+    BASE_DIR,
+    CVE_KB_PATH,
     DEFAULT_LIBHUNTER_TIMEOUT,
     DEFAULT_PHUNTER_THREADS,
     DEFAULT_PHUNTER_TIMEOUT,
@@ -27,6 +31,10 @@ from config import (
     PHUNTER_JAR,
     PICKLE_CACHE_DIR,
     PHUNTER_HEARTBEAT_TIMEOUT,  
+    PHUNTER_PREWARM_TIMEOUT,
+    PHUNTER_PREWARM_SOURCE_DEFAULT,
+    PHUNTER_CACHE_DIR,
+    PHUNTER_CACHE_MODE,
     PYTHON_BIN,
     RAW_DIR,
     SUBPROCESS_HEARTBEAT_TIMEOUT,
@@ -55,11 +63,197 @@ _PHUNTER_RESOURCE_LIMIT_PATTERN = re.compile(
     r"(pthread_create\s+failed|unable\s+to\s+create\s+native\s+thread|EAGAIN|process/resource\s+limits\s+reached)",
     re.IGNORECASE,
 )   
+_PHUNTER_FATAL_PATTERN = re.compile(
+    r"(failed\s+to\s+parse\s+command-line\s+arguments|the\s+analysis\s+has\s+failed)",
+    re.IGNORECASE,
+)
+_STAGE_TOKEN_PATTERN = re.compile(r"(^|[^a-z0-9])(pre|post)([^a-z0-9]|$)", re.IGNORECASE)
+
+TPL_CVES_ROOT = BASE_DIR / "TPL-CVEs"
 
 
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content or "", encoding="utf-8")
+
+
+def _has_phunter_fatal(text: str) -> bool:
+    return bool(_PHUNTER_FATAL_PATTERN.search(text or ""))
+
+
+def _normalize_prewarm_source(source: str | None) -> str:
+    text = (source or PHUNTER_PREWARM_SOURCE_DEFAULT or "cve_kb").strip().lower()
+    if text in {"tpl_cves", "tpl-cves", "tpl"}:
+        return "tpl_cves"
+    return "cve_kb"
+
+
+def _classify_stage(binary_path: Path) -> str | None:
+    stem = binary_path.stem.lower()
+    match = _STAGE_TOKEN_PATTERN.search(stem)
+    if not match:
+        return None
+    stage = match.group(2).lower()
+    if stage in {"pre", "post"}:
+        return stage
+    return None
+
+
+def _pair_key(binary_path: Path) -> str | None:
+    stem = binary_path.stem.lower()
+    if not _STAGE_TOKEN_PATTERN.search(stem):
+        return None
+
+    def _replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{{stage}}{match.group(3)}"
+
+    normalized = _STAGE_TOKEN_PATTERN.sub(_replace, stem, count=1)
+    return f"{binary_path.suffix.lower()}::{normalized}"
+
+
+def _load_prewarm_targets_from_cve_kb() -> list[dict]:
+    try:
+        data = json.loads(CVE_KB_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        return []
+
+    targets: list[dict] = []
+    for row in data if isinstance(data, list) else []:
+        pre = row.get("pre_patch_jar")
+        post = row.get("post_patch_jar")
+        diff = row.get("patch_diff")
+        if not pre or not post:
+            continue
+        pre_path = Path(pre)
+        post_path = Path(post)
+        diff_path = Path(diff) if diff else None
+        if not pre_path.is_absolute():
+            pre_path = (BASE_DIR / pre_path).resolve()
+        else:
+            pre_path = pre_path.expanduser().resolve()
+        if not post_path.is_absolute():
+            post_path = (BASE_DIR / post_path).resolve()
+        else:
+            post_path = post_path.expanduser().resolve()
+        if diff_path is not None:
+            if not diff_path.is_absolute():
+                diff_path = (BASE_DIR / diff_path).resolve()
+            else:
+                diff_path = diff_path.expanduser().resolve()
+        targets.append({
+            "cve_id": str(row.get("cve_id", "")),
+            "pre_patch_jar": str(pre_path),
+            "post_patch_jar": str(post_path),
+            "patch_diff": str(diff_path) if diff_path is not None else "",
+        })
+    return targets
+
+
+def _load_prewarm_targets_from_tpl_cves(root: Path) -> list[dict]:
+    if not root.exists():
+        return []
+
+    targets: list[dict] = []
+    for cve_dir in root.rglob("*"):
+        if not cve_dir.is_dir():
+            continue
+        diff_files = sorted(
+            p for p in cve_dir.glob("*.diff")
+            if ":zone.identifier" not in p.name.lower()
+        )
+        if not diff_files:
+            continue
+        binaries = sorted(
+            p for p in cve_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in {".jar", ".aar"}
+            and ":zone.identifier" not in p.name.lower()
+        )
+        if not binaries:
+            continue
+        grouped: dict[str, dict[str, list[Path]]] = {}
+        for binary in binaries:
+            stage = _classify_stage(binary)
+            key = _pair_key(binary)
+            if stage is None or key is None:
+                continue
+            grouped.setdefault(key, {"pre": [], "post": []})
+            grouped[key][stage].append(binary)
+
+        if not grouped:
+            continue
+        cve_id = cve_dir.name
+        # 多 diff 时按文件名稳定取第一份，后续按命中 key 复用即可。
+        patch_diff = diff_files[0]
+        for group in grouped.values():
+            if not group["pre"] or not group["post"]:
+                continue
+            for pre in group["pre"]:
+                for post in group["post"]:
+                    targets.append({
+                        "cve_id": cve_id,
+                        "pre_patch_jar": str(pre.resolve()),
+                        "post_patch_jar": str(post.resolve()),
+                        "patch_diff": str(patch_diff.resolve()),
+                    })
+    return targets
+
+
+def _dedupe_prewarm_targets(targets: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for target in targets:
+        key = (
+            str(target.get("pre_patch_jar", "")).strip(),
+            str(target.get("post_patch_jar", "")).strip(),
+            str(target.get("patch_diff", "")).strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(target)
+    return deduped
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_analysis_cache_ready(cache_root: Path, domain: str, source_file: Path) -> bool:
+    domain_root = cache_root / domain
+    candidates: list[Path] = []
+    if source_file.exists() and source_file.is_file():
+        candidates.append(source_file)
+    # PHunter 会先把 .aar 转成同名 .jar 再做分析缓存；
+    # 预热校验需兼容这一路径，避免把已成功任务误判为失败。
+    if source_file.suffix.lower() == ".aar":
+        jar_candidate = source_file.with_suffix(".jar")
+        if jar_candidate.exists() and jar_candidate.is_file():
+            candidates.append(jar_candidate)
+
+    seen_hashes: set[str] = set()
+    for candidate in candidates:
+        file_hash = _sha256_file(candidate)
+        if file_hash in seen_hashes:
+            continue
+        seen_hashes.add(file_hash)
+        # 兼容新旧布局:
+        # - 新布局: <domain>/soot_cache_hash/<hash>/
+        # - 旧布局: <domain>/<hash>/
+        candidate_entries = [
+            domain_root / "soot_cache_hash" / file_hash,
+            domain_root / file_hash,
+        ]
+        for entry in candidate_entries:
+            if (entry / ".ready").exists() and (entry / "analyzer.bin").exists():
+                return True
+    return False
 
 
 def run_logged_command(
@@ -349,27 +543,163 @@ def _is_phunter_resource_limit(text: str) -> bool:
 
 def build_phunter_cmd(
     *,
-    apk_path: Path,
-    pre_patch_jar: Path,
-    post_patch_jar: Path,
-    patch_diff: Path,
-    thread_num: int,
+    apk_path: Path | None = None,
+    pre_patch_jar: Path | None = None,
+    post_patch_jar: Path | None = None,
+    patch_diff: Path | None = None,
+    thread_num: int | None = None,
     java_opts: list[str] | None = None,
+    cache_dir: Path | None = None,
+    cache_mode: str | None = None,
+    prewarm_tpl_only: bool = False,
+    prewarm_apk_only: bool = False,
 ) -> list[str]:
     cmd = [str(JAVA_BIN)]
     if java_opts:
         cmd.extend(java_opts)
-    cmd.extend([
-        "-jar",
-        str(PHUNTER_JAR),
-        "--preTPL", str(pre_patch_jar),
-        "--postTPL", str(post_patch_jar),
-        "--threadNum", str(thread_num),
-        "--androidJar", str(ANDROID_JAR),
-        "--patchFiles", str(patch_diff),
-        "--targetAPK", str(apk_path),
-    ])
+    cmd.extend(["-jar", str(PHUNTER_JAR)])
+    if pre_patch_jar is not None:
+        cmd.extend(["--preTPL", str(pre_patch_jar)])
+    if post_patch_jar is not None:
+        cmd.extend(["--postTPL", str(post_patch_jar)])
+    if thread_num is not None:
+        cmd.extend(["--threadNum", str(thread_num)])
+    cmd.extend(["--androidJar", str(ANDROID_JAR)])
+    if patch_diff is not None:
+        cmd.extend(["--patchFiles", str(patch_diff)])
+    if apk_path is not None:
+        cmd.extend(["--targetAPK", str(apk_path)])
+    if cache_dir is not None:
+        cmd.extend(["--cacheDir", str(cache_dir)])
+    if cache_mode:
+        cmd.extend(["--cacheMode", str(cache_mode)])
+    if prewarm_tpl_only:
+        cmd.append("--prewarmOnly")
+    if prewarm_apk_only:
+        cmd.append("--prewarmAPKOnly")
     return cmd
+
+
+def prewarm_phunter_templates(source: str | None = None) -> dict:
+    source_norm = _normalize_prewarm_source(source)
+    if source_norm == "tpl_cves":
+        targets = _load_prewarm_targets_from_tpl_cves(TPL_CVES_ROOT)
+    else:
+        targets = _load_prewarm_targets_from_cve_kb()
+    targets = _dedupe_prewarm_targets(targets)
+
+    summary = {
+        "source": source_norm,
+        "total": len(targets),
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+        "fallback_used": 0,
+    }
+    if not targets:
+        return summary
+
+    print(f"[phunter] 模板预热源: {source_norm}, 待处理: {len(targets)}")
+    for idx, target in enumerate(targets, start=1):
+        pre = Path(target["pre_patch_jar"]).expanduser().resolve()
+        post = Path(target["post_patch_jar"]).expanduser().resolve()
+        if not pre.exists() or not post.exists():
+            summary["skipped"] += 1
+            continue
+
+        # 先走上层 analysis 缓存路径；仅当其失败时才回退到下层 Soot 缓存路径。
+        cmd = build_phunter_cmd(
+            pre_patch_jar=pre,
+            post_patch_jar=post,
+            cache_dir=PHUNTER_CACHE_DIR,
+            cache_mode=PHUNTER_CACHE_MODE,
+            prewarm_tpl_only=True,
+        )
+        cve_id = target.get("cve_id") or f"item-{idx}"
+        log_tag = f"phunter_prewarm_tpl_{idx:04d}_{cve_id}"
+        upper_env = dict(os.environ)
+        upper_env["PHUNTER_ANALYSIS_CACHE_ONLY"] = "1"
+        result = run_logged_command(
+            cmd,
+            cwd=PHUNTER_DIR,
+            timeout=PHUNTER_PREWARM_TIMEOUT,
+            env=upper_env,
+            stream_output=True,
+            heartbeat_timeout=0,
+            stdout_log=LOG_DIR / f"{log_tag}.stdout.log",
+            stderr_log=LOG_DIR / f"{log_tag}.stderr.log",
+        )
+        combined = "\n".join(p for p in (result.stdout, result.stderr) if p)
+        upper_ready = (
+            _is_analysis_cache_ready(PHUNTER_CACHE_DIR, "binary_analysis", pre)
+            and _is_analysis_cache_ready(PHUNTER_CACHE_DIR, "binary_analysis", post)
+        )
+        upper_ok = result.returncode == 0 and not _has_phunter_fatal(combined) and upper_ready
+
+        if upper_ok:
+            summary["success"] += 1
+            continue
+
+        summary["fallback_used"] += 1
+        print(f"[phunter] 上层缓存预热失败，回退下层链路: {cve_id} (rc={result.returncode})")
+
+        fallback_cmd = build_phunter_cmd(
+            pre_patch_jar=pre,
+            post_patch_jar=post,
+            cache_dir=PHUNTER_CACHE_DIR,
+            cache_mode=PHUNTER_CACHE_MODE,
+            prewarm_tpl_only=True,
+        )
+        fallback_env = dict(os.environ)
+        fallback_env.pop("PHUNTER_ANALYSIS_CACHE_ONLY", None)
+        fallback_result = run_logged_command(
+            fallback_cmd,
+            cwd=PHUNTER_DIR,
+            timeout=PHUNTER_PREWARM_TIMEOUT,
+            env=fallback_env,
+            stream_output=True,
+            heartbeat_timeout=0,
+            stdout_log=LOG_DIR / f"{log_tag}.fallback.stdout.log",
+            stderr_log=LOG_DIR / f"{log_tag}.fallback.stderr.log",
+        )
+        fallback_combined = "\n".join(p for p in (fallback_result.stdout, fallback_result.stderr) if p)
+        fallback_ready = (
+            _is_analysis_cache_ready(PHUNTER_CACHE_DIR, "binary_analysis", pre)
+            and _is_analysis_cache_ready(PHUNTER_CACHE_DIR, "binary_analysis", post)
+        )
+        if fallback_result.returncode == 0 and not _has_phunter_fatal(fallback_combined) and fallback_ready:
+            summary["success"] += 1
+        else:
+            summary["failed"] += 1
+            print(f"[phunter] 预热失败 {cve_id} (rc={fallback_result.returncode})")
+    return summary
+
+
+def prewarm_phunter_apk_cache(apk_path: str | Path) -> dict:
+    apk = Path(apk_path).expanduser().resolve()
+    if not apk.exists():
+        return {"status": "skipped", "reason": f"APK not found: {apk}"}
+
+    cmd = build_phunter_cmd(
+        apk_path=apk,
+        cache_dir=PHUNTER_CACHE_DIR,
+        cache_mode=PHUNTER_CACHE_MODE,
+        prewarm_apk_only=True,
+    )
+    result = run_logged_command(
+        cmd,
+        cwd=PHUNTER_DIR,
+        timeout=PHUNTER_PREWARM_TIMEOUT,
+        env=None,
+        stream_output=True,
+        heartbeat_timeout=0,
+        stdout_log=LOG_DIR / f"phunter_prewarm_apk_{apk.stem}.stdout.log",
+        stderr_log=LOG_DIR / f"phunter_prewarm_apk_{apk.stem}.stderr.log",
+    )
+    combined = "\n".join(p for p in (result.stdout, result.stderr) if p)
+    if result.returncode == 0 and not _has_phunter_fatal(combined):
+        return {"status": "success", "returncode": 0}
+    return {"status": "failed", "returncode": result.returncode, "stderr": result.stderr}
 
 
 def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
@@ -398,6 +728,8 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         patch_diff=patch_diff,
         thread_num=thread_num,
         java_opts=java_opts,
+        cache_dir=PHUNTER_CACHE_DIR,
+        cache_mode=PHUNTER_CACHE_MODE,
     )
 
     result = run_logged_command(
@@ -448,6 +780,8 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
             patch_diff=patch_diff,
             thread_num=retry_thread_num,
             java_opts=retry_java_opts,
+            cache_dir=PHUNTER_CACHE_DIR,
+            cache_mode=PHUNTER_CACHE_MODE,
         )
         retry_result = run_logged_command(
             retry_cmd,
@@ -483,7 +817,10 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
     pre_similarity = _extract_float(_PRE_SIMILARITY_PATTERN, combined)
     post_similarity = _extract_float(_POST_SIMILARITY_PATTERN, combined)
 
-    if result.returncode == 0:
+    if result.returncode == 0 and _has_phunter_fatal(combined):
+        status = "failed"
+        patch_status = "UNKNOWN"
+    elif result.returncode == 0:
         status = "success"
     elif _is_phunter_resource_limit(combined):
         status = "resource_limited"

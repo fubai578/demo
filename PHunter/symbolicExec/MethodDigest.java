@@ -11,25 +11,37 @@ import treeEditDistance.node.Node;
 import treeEditDistance.node.PredicateNodeData;
 
 import javax.script.ScriptException;
+import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static analyze.PatchPresentTest_new.*;
 
-public class MethodDigest {
-    public List<List<Unit>> realUnitsPaths = new LinkedList<>();
+public class MethodDigest implements Serializable {
+    private static final long serialVersionUID = 1L;
+    private static final int STATE_FINGERPRINT_LOCAL_LIMIT = 64;
+    private static final int METHOD_TRAVERSAL_NODE_BUDGET = readIntEnv("PHUNTER_DIGEST_METHOD_BUDGET_NODES", 250000);
+    private static final long METHOD_TRAVERSAL_TIME_BUDGET_MS = readLongEnv("PHUNTER_DIGEST_METHOD_BUDGET_MS", 30000L);
+    public transient List<List<Unit>> realUnitsPaths = new LinkedList<>();
+    public List<String> realPathTailKinds = new LinkedList<>();
 
     public List<List<String>> realSignatures = new LinkedList<>();//Record the function signature on the path
     public List<List<String>> realVariables = new LinkedList<>();//Record the variables on the path
     public List<List<String>> LibIDPaths = new LinkedList<>();//Record the LibID's signature.
-    public List<Unit> patchRelatedUnits;
+    public transient List<Unit> patchRelatedUnits;
     public List<List<Node<PredicateNodeData>>> realPredicates = new LinkedList<>();//Store the predicates on each path
     private boolean isOptimize;
 
     public boolean isMethodTooLarge = false;
+    public transient int stateDedupPrunedCount = 0;
+    private transient Set<String> visitedStateFingerprints = new HashSet<>();
+    private transient long traversalStartNanos = 0L;
+    private transient int traversalNodeVisits = 0;
 
     public MethodDigest(Body body, List<Integer> patchRelatedUnits) {
         this.patchRelatedUnits = patchRelatedUnits == null ? null
@@ -43,6 +55,10 @@ public class MethodDigest {
     }
 
     public void enumMethodPath(Body body) {//Traversing paths and filtering by predicate
+        visitedStateFingerprints = new HashSet<>();
+        stateDedupPrunedCount = 0;
+        traversalStartNanos = System.nanoTime();
+        traversalNodeVisits = 0;
         BriefBlockGraph bg = new BriefBlockGraph(body);
 //        modifyBlockGraph(bg, body);
         int num = bg.getBlocks().size();
@@ -102,6 +118,14 @@ public class MethodDigest {
             isMethodTooLarge = true;
             return;
         }
+        if (isTraversalBudgetExceeded()) {
+            markTooLargeWithFallbackPath(unitPath, signature, variable, predicate, LibIDPath);
+            return;
+        }
+        traversalNodeVisits += 1;
+        if (shouldPruneByState(head, local, predicate, LibIDPath)) {
+            return;
+        }
         String LibID = "";
         unitPath.addAll(getBlockUnits(head));//Add the information in the head to the list
         signature.addAll(getBlockSignatures(head));
@@ -110,6 +134,7 @@ public class MethodDigest {
         List<Block> nextBlocks = head.getSuccs();
         if (nextBlocks.isEmpty()) {
             this.realUnitsPaths.add(unitPath);
+            this.realPathTailKinds.add(pathTailKind(unitPath));
             this.realPredicates.add(predicate);
             this.realVariables.add(variable);
             this.realSignatures.add(signature);
@@ -174,11 +199,27 @@ public class MethodDigest {
         for (Unit unit : block) {
             Stmt stmt = (Stmt) unit;
             if (stmt.containsFieldRef()) {
-                SootField field = stmt.getFieldRef().getField();
-                variable.add(field.getDeclaringClass().getName() + "," + field.getType() + ",");
+                try {
+                    SootField field = stmt.getFieldRef().getField();
+                    if (field == null || field.getDeclaringClass() == null || field.getType() == null) {
+                        variable.add("java.lang.Object,java.lang.Object,");
+                    } else {
+                        variable.add(field.getDeclaringClass().getName() + "," + field.getType() + ",");
+                    }
+                } catch (RuntimeException ex) {
+                    variable.add("java.lang.Object,java.lang.Object,");
+                }
             } else if (stmt.containsArrayRef()) {
-                ArrayRef arrayRef = stmt.getArrayRef();
-                variable.add(arrayRef.getType().getArrayType().toString() + ",");
+                try {
+                    ArrayRef arrayRef = stmt.getArrayRef();
+                    if (arrayRef == null || arrayRef.getType() == null) {
+                        variable.add("java.lang.Object,");
+                    } else {
+                        variable.add(arrayRef.getType().getArrayType().toString() + ",");
+                    }
+                } catch (RuntimeException ex) {
+                    variable.add("java.lang.Object,");
+                }
             }
         }
         return variable;
@@ -522,26 +563,271 @@ public class MethodDigest {
     private int optimizePredicate(Node<PredicateNodeData> ast) {
         if (!isOptimize)
             return -1;
+        if (sePy == null || seJs == null) {
+            return -1;
+        }
         String str = ast.extractNodeData(ast);
-        Boolean result;
         try {
-            if (str.contains("^") | str.contains("|") | str.contains("&"))//Determine if it contains bitwise operations
-                result = (Boolean) sePy.eval(str);
-            else
-                result = (Boolean) seJs.eval(str);
+            Object evalResult;
+            if (str.contains("^") || str.contains("|") || str.contains("&")) {// Determine if it contains bitwise operations
+                evalResult = sePy.eval(str);
+            } else {
+                evalResult = seJs.eval(str);
+            }
+            Boolean result = toBoolean(evalResult);
+            if (result == null) {
+                return -1;
+            }
             if (result)
                 return 1;
             else
                 return 0;
         } catch (ScriptException ignored) {
             return -1;
+        } catch (RuntimeException ignored) {
+            return -1;
         }
     }
 
+    private Boolean toBoolean(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Boolean) {
+            return (Boolean) value;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).doubleValue() != 0.0;
+        }
+        String text = value.toString();
+        if (text == null) {
+            return null;
+        }
+        text = text.trim();
+        if (text.equalsIgnoreCase("true")) {
+            return true;
+        }
+        if (text.equalsIgnoreCase("false")) {
+            return false;
+        }
+        return null;
+    }
+
+    public int getPathCount() {
+        return realPathTailKinds == null ? 0 : realPathTailKinds.size();
+    }
+
+    public String getPathTailKind(int index) {
+        if (realPathTailKinds == null || index < 0 || index >= realPathTailKinds.size()) {
+            return "OTHER";
+        }
+        return realPathTailKinds.get(index);
+    }
+
+    public static boolean isTailKindCompatible(String left, String right) {
+        return left != null && left.equals(right)
+                && ("RETURN".equals(left) || "RETURN_VOID".equals(left) || "THROW".equals(left));
+    }
+
+    public void prepareForSerialization() {
+        if (realPredicates != null) {
+            for (List<Node<PredicateNodeData>> predicates : realPredicates) {
+                for (Node<PredicateNodeData> predicate : predicates) {
+                    normalizePredicateNode(predicate);
+                }
+            }
+        }
+        patchRelatedUnits = null;
+    }
+
+    private void normalizePredicateNode(Node<PredicateNodeData> node) {
+        if (node == null) {
+            return;
+        }
+        PredicateNodeData data = node.getNodeData();
+        if (data != null && data.getNodeType() == null) {
+            data.setNodeType(NodeType.Parameter);
+            data.setData("UNK");
+            data.setValue(null);
+        }
+        for (Node<PredicateNodeData> child : node.getChildren()) {
+            normalizePredicateNode(child);
+        }
+    }
+
+    private String pathTailKind(List<Unit> unitPath) {
+        if (unitPath == null || unitPath.isEmpty()) {
+            return "OTHER";
+        }
+        Unit tail = unitPath.get(unitPath.size() - 1);
+        if (tail instanceof ReturnStmt) {
+            return "RETURN";
+        }
+        if (tail instanceof ReturnVoidStmt) {
+            return "RETURN_VOID";
+        }
+        if (tail instanceof ThrowStmt) {
+            return "THROW";
+        }
+        return "OTHER";
+    }
+
     public void checkSpecialCase(Body body) {
-        if (realUnitsPaths.size() == 0) {
+        if (realUnitsPaths != null && realUnitsPaths.size() == 0) {
             isOptimize = false;
             enumMethodPath(body);
+        }
+    }
+
+    private boolean shouldPruneByState(
+            Block head,
+            HashMap<Value, Node<PredicateNodeData>> local,
+            List<Node<PredicateNodeData>> predicate,
+            List<String> libIDPath
+    ) {
+        if (visitedStateFingerprints == null) {
+            visitedStateFingerprints = new HashSet<>();
+        }
+        String key = buildStateFingerprint(head, local, predicate, libIDPath);
+        if (!visitedStateFingerprints.add(key)) {
+            stateDedupPrunedCount += 1;
+            return true;
+        }
+        return false;
+    }
+
+    private String buildStateFingerprint(
+            Block head,
+            HashMap<Value, Node<PredicateNodeData>> local,
+            List<Node<PredicateNodeData>> predicate,
+            List<String> libIDPath
+    ) {
+        int blockId = head.getIndexInMethod();
+        int localSumHash = 1;
+        int localXorHash = 0;
+        int localCount = 0;
+        if (local != null && !local.isEmpty()) {
+            for (HashMap.Entry<Value, Node<PredicateNodeData>> entry : local.entrySet()) {
+                int entryHash = entryFingerprint(entry);
+                localSumHash += entryHash;
+                localXorHash ^= Integer.rotateLeft(entryHash, 7);
+                localCount += 1;
+                if (localCount >= STATE_FINGERPRINT_LOCAL_LIMIT) {
+                    break;
+                }
+            }
+        }
+
+        int predicateHash = 1;
+        int predicateSize = predicate == null ? 0 : predicate.size();
+        if (predicateSize > 0) {
+            Node<PredicateNodeData> tail = predicate.get(predicateSize - 1);
+            predicateHash = shallowNodeFingerprint(tail);
+        }
+
+        int libTailHash = 0;
+        int libPathSize = libIDPath == null ? 0 : libIDPath.size();
+        if (libPathSize > 0) {
+            String tail = libIDPath.get(libPathSize - 1);
+            libTailHash = tail == null ? 0 : tail.hashCode();
+        }
+
+        return blockId
+                + "|lc=" + localCount
+                + "|lhs=" + localSumHash
+                + "|lhx=" + localXorHash
+                + "|ps=" + predicateSize
+                + "|ph=" + predicateHash
+                + "|ls=" + libPathSize
+                + "|lt=" + libTailHash;
+    }
+
+    private int entryFingerprint(HashMap.Entry<Value, Node<PredicateNodeData>> entry) {
+        Value key = entry.getKey();
+        Node<PredicateNodeData> value = entry.getValue();
+        int hash = 17;
+        if (key != null) {
+            hash = 31 * hash + key.getClass().getName().hashCode();
+            hash = 31 * hash + key.toString().hashCode();
+        }
+        hash = 31 * hash + shallowNodeFingerprint(value);
+        return hash;
+    }
+
+    private int shallowNodeFingerprint(Node<PredicateNodeData> node) {
+        if (node == null) {
+            return 0;
+        }
+        int hash = 13;
+        PredicateNodeData data = node.getNodeData();
+        if (data != null) {
+            NodeType nodeType = data.getNodeType();
+            if (nodeType != null) {
+                hash = 31 * hash + nodeType.name().hashCode();
+            }
+            String payload = data.getData();
+            if (payload != null) {
+                hash = 31 * hash + payload.hashCode();
+            }
+            Value value = data.getValue();
+            if (value != null) {
+                hash = 31 * hash + value.toString().hashCode();
+            }
+        }
+        hash = 31 * hash + node.getChildren().size();
+        return hash;
+    }
+
+    private boolean isTraversalBudgetExceeded() {
+        if (METHOD_TRAVERSAL_NODE_BUDGET > 0 && traversalNodeVisits >= METHOD_TRAVERSAL_NODE_BUDGET) {
+            return true;
+        }
+        if (METHOD_TRAVERSAL_TIME_BUDGET_MS > 0 && traversalStartNanos > 0L) {
+            long elapsedMs = (System.nanoTime() - traversalStartNanos) / 1_000_000L;
+            return elapsedMs >= METHOD_TRAVERSAL_TIME_BUDGET_MS;
+        }
+        return false;
+    }
+
+    private void markTooLargeWithFallbackPath(
+            List<Unit> unitPath,
+            List<String> signature,
+            List<String> variable,
+            List<Node<PredicateNodeData>> predicate,
+            List<String> libIDPath
+    ) {
+        isMethodTooLarge = true;
+        if (realUnitsPaths.isEmpty() && unitPath != null && !unitPath.isEmpty()) {
+            realUnitsPaths.add(new ArrayList<>(unitPath));
+            realPathTailKinds.add(pathTailKind(unitPath));
+            realPredicates.add(predicate == null ? new ArrayList<>() : new ArrayList<>(predicate));
+            realVariables.add(variable == null ? new ArrayList<>() : new ArrayList<>(variable));
+            realSignatures.add(signature == null ? new ArrayList<>() : new ArrayList<>(signature));
+            LibIDPaths.add(libIDPath == null ? new ArrayList<>() : new ArrayList<>(libIDPath));
+        }
+    }
+
+    private static int readIntEnv(String key, int fallback) {
+        try {
+            String value = System.getenv(key);
+            if (value == null || value.trim().isEmpty()) {
+                return fallback;
+            }
+            return Integer.parseInt(value.trim());
+        } catch (RuntimeException ex) {
+            return fallback;
+        }
+    }
+
+    private static long readLongEnv(String key, long fallback) {
+        try {
+            String value = System.getenv(key);
+            if (value == null || value.trim().isEmpty()) {
+                return fallback;
+            }
+            return Long.parseLong(value.trim());
+        } catch (RuntimeException ex) {
+            return fallback;
         }
     }
 }
