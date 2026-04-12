@@ -6,10 +6,6 @@ import org.slf4j.LoggerFactory;
 import similarity.CombinationSelect;
 import similarity.PathSimilarityThread;
 import similarity.SimilarityUtil;
-import soot.RefType;
-import soot.SootMethod;
-import soot.Type;
-import soot.jimple.Stmt;
 import symbolicExec.MethodDigest;
 import treeEditDistance.costmodel.PredicateCostModel_back;
 import treeEditDistance.distance.APTED;
@@ -70,10 +66,19 @@ public class PatchPresentTest_new {
             }
         }
 
-        logger.info("patch-related methods are:");
-        for (Map.Entry<ClassAttr, Set<MarkedMethod>> entry : summary.patchRelatedMethods.entrySet()) {
-            for (MarkedMethod values : entry.getValue()) {
-                System.out.print(values.isPre + "\t" + values + "\n");
+//        logger.info("patch-related methods are:");
+//        for (Map.Entry<ClassAttr, Set<MarkedMethod>> entry : summary.patchRelatedMethods.entrySet()) {
+//            for (MarkedMethod values : entry.getValue()) {
+//                System.out.print(values.isPre + "\t" + values + "\n");
+//            }
+//        }
+        // Codex modification: print patch-related method details only in debug mode to keep default output concise like legacy PHunter.
+        if (config.isEnableDebugLevel()) {
+            logger.info("patch-related methods are:");
+            for (Map.Entry<ClassAttr, Set<MarkedMethod>> entry : summary.patchRelatedMethods.entrySet()) {
+                for (MarkedMethod values : entry.getValue()) {
+                    System.out.print(values.isPre + "\t" + values + "\n");
+                }
             }
         }
 
@@ -168,26 +173,30 @@ public class PatchPresentTest_new {
         Map<MarkedMethod, MethodDigest> accessedMethod = new HashMap<>();
         for (Set<MarkedMethod> patchRelatedMethods : summary.patchRelatedMethods.values()) {
             for (MarkedMethod patchRelatedMethod : patchRelatedMethods) {
-//                System.out.println("1 "+patchRelatedMethod.m.signature);
-                MethodDigest tpl = new MethodDigest(patchRelatedMethod.m.body,
+                MethodDigest tpl = patchRelatedMethod.m.ensureDigest(
                         patchRelatedMethod.patchRelatedLines);
+                if (tpl == null) {
+                    continue;
+                }
                 Set<MarkedMethod> appMethods = candidateMatchedMethods.get(patchRelatedMethod);
                 if (appMethods == null)
                     continue;
                 float max = -1;
                 MarkedMethod optimalPair = null;
                 for (MarkedMethod appMethod : appMethods) {
-//                    System.out.println("2 "+appMethod.m.signature);
                     MethodDigest app;
                     if (!accessedMethod.containsKey(appMethod)) {
-                        app = new MethodDigest(appMethod.m.body, null);
+                        app = appMethod.m.ensureDigest(null);
+                        if (app == null) {
+                            continue;
+                        }
                         Map<String, String> typeRecoveryMap = typeRecovery(patchRelatedMethod, appMethod);
                         recoveryAppMethod(app, typeRecoveryMap);
                         accessedMethod.put(appMethod, app);
                     } else
                         app = accessedMethod.get(appMethod);
 
-                    if (app.realUnitsPaths.isEmpty()) {
+                    if (app.getPathCount() == 0) {
                         System.err.println(appMethod.m.signature + " has no paths, that is wired");
                         continue;
                     }
@@ -234,7 +243,9 @@ public class PatchPresentTest_new {
         // pre - mod + post - mod + mod
         int patchRelatedMethodCnt = summary.postMethodCnt + summary.preMethodCnt - summary.modifiedMethodCnt;
 
-        System.out.printf("patch-related method count = %d\n", patchRelatedMethodCnt);
+//        System.out.printf("patch-related method count = %d\n", patchRelatedMethodCnt);
+        // Codex modification: use println to avoid interleaving with logger output.
+        System.out.println("patch-related method count = " + patchRelatedMethodCnt);
 
         double dynamicThreshold = finalMethodSimilarityThreshold / patchRelatedMethodCnt;
 
@@ -306,19 +317,17 @@ public class PatchPresentTest_new {
     private Map<String, String> typeRecovery(MarkedMethod tplMethod, MarkedMethod appMethod) {
         Map<String, String> tplMapAppClass = new HashMap<>();
 
-        SootMethod tpl = tplMethod.m.body.getMethod();
-        SootMethod apk = appMethod.m.body.getMethod();
-
         // 1. map current class
-        tplMapAppClass.put(apk.getDeclaringClass().getName(), tpl.getDeclaringClass().getName());
+        tplMapAppClass.put(appMethod.m.declaredClass.name, tplMethod.m.declaredClass.name);
 
         // 2. map method sig
         // 2.1 return type
-        mapType(tpl.getReturnType(), apk.getReturnType(), tplMapAppClass);
+        mapTypeName(tplMethod.m.returnType, appMethod.m.returnType, tplMapAppClass);
 
         // 2.2 parameter
-        for (int i = 0; i < tpl.getParameterTypes().size(); i++) {
-            mapType(tpl.getParameterType(i), apk.getParameterType(i), tplMapAppClass);
+        int paramCount = Math.min(tplMethod.m.parameterTypes.size(), appMethod.m.parameterTypes.size());
+        for (int i = 0; i < paramCount; i++) {
+            mapTypeName(tplMethod.m.parameterTypes.get(i), appMethod.m.parameterTypes.get(i), tplMapAppClass);
         }
 
         // 3. all possible <init> parameters
@@ -327,56 +336,50 @@ public class PatchPresentTest_new {
                 continue;
             MarkedMethod matchedAppInitMethod = candidateInitMap.get(tplInit);
             if (matchedAppInitMethod != null) {
-                SootMethod tplInitSootMethod = tplInit.body.getMethod();
-                SootMethod apkInitSootMethod = matchedAppInitMethod.m.body.getMethod();
-                if (apkInitSootMethod == null)
-                    continue;
-                for (int i = 0; i < tplInitSootMethod.getParameterTypes().size(); i++) {
-                    mapType(tplInitSootMethod.getParameterType(i),
-                            apkInitSootMethod.getParameterType(i), tplMapAppClass);
+                int initParamCount = Math.min(tplInit.parameterTypes.size(),
+                        matchedAppInitMethod.m.parameterTypes.size());
+                for (int i = 0; i < initParamCount; i++) {
+                    mapTypeName(tplInit.parameterTypes.get(i),
+                            matchedAppInitMethod.m.parameterTypes.get(i), tplMapAppClass);
                 }
             }
         }
         return tplMapAppClass;
     }
 
-    private void mapType(Type tplType, Type appType, Map<String, String> map) {
-        if (appType instanceof RefType) {
-            RefType refType = (RefType) appType;
-            if (refType.getSootClass().isApplicationClass()
-                    || refType.getSootClass().isPhantomClass()) {
-                StringBuilder tplTypeSb = new StringBuilder();
-                if (tplType.toString().contains("[]")) {
-                    int index = tplType.toString().indexOf("[");
-                    tplTypeSb.append(tplType.toString(), 0, index);
-                } else
-                    tplTypeSb.append(tplType);
-
-                StringBuilder appTypeSb = new StringBuilder();
-                if (refType.toString().contains("[]")) {
-                    int index = refType.toString().indexOf("[");
-                    appTypeSb.append(refType.toString(), 0, index);
-                } else
-                    appTypeSb.append(refType);
-
-                map.put(appTypeSb.toString(), tplTypeSb.toString());
-            }
+    private void mapTypeName(String tplType, String appType, Map<String, String> map) {
+        if (tplType == null || appType == null) {
+            return;
         }
+        String appTypeBase = stripArraySuffix(appType);
+        if (SimilarityUtil.isJavaLibraryClass(appTypeBase) || MethodAttr.isAndroidClass(appTypeBase)) {
+            return;
+        }
+        String tplTypeBase = stripArraySuffix(tplType);
+        map.put(appTypeBase, tplTypeBase);
+    }
+
+    private String stripArraySuffix(String typeName) {
+        if (typeName == null) {
+            return "";
+        }
+        int idx = typeName.indexOf('[');
+        return idx >= 0 ? typeName.substring(0, idx) : typeName;
     }
 
     private float MethodSimilarityCompute(MethodDigest tpl, MethodDigest app) {
-        int tplPathCount = tpl.realUnitsPaths.size();
-        int appPathCount = app.realUnitsPaths.size();
+        int tplPathCount = tpl.getPathCount();
+        int appPathCount = app.getPathCount();
 
         float[][] sim = new float[tplPathCount][appPathCount];
         ExecutorService es = Executors.newFixedThreadPool(config.getThreadNumber());
         for (int i = 0; i < tplPathCount; i++) {
-            Stmt tplLastStmt = (Stmt) tpl.realUnitsPaths.get(i).get(tpl.realUnitsPaths.get(i).size() - 1);
+            String tplTailKind = tpl.getPathTailKind(i);
             List<Node<PredicateNodeData>> tplPredicateList = tpl.realPredicates.get(i);
             List<String> tplSignature = tpl.realSignatures.get(i);
             List<String> tplVariable = tpl.realVariables.get(i);
             es.execute(new PathSimilarityThread(sim[i], tplPredicateList, tplSignature,
-                    tplVariable, app, tplLastStmt));
+                    tplVariable, app, tplTailKind));
 //            List<String> tplLibIDPath = tpl.LibIDPaths.get(i);
 //            es.execute(new LibIDThread(sim[i], tplLibIDPath, app, tplLastStmt));
         }
@@ -396,7 +399,7 @@ public class PatchPresentTest_new {
     private void recoveryAppMethod(MethodDigest app, Map<String, String> typeRecoveryMap) {
         // do recovery
         Set<PredicateNodeData> accessd = new HashSet<>();
-        for (int i = 0; i < app.realUnitsPaths.size(); i++) {
+        for (int i = 0; i < app.getPathCount(); i++) {
             List<Node<PredicateNodeData>> appPredicateList = app.realPredicates.get(i);
             List<String> appSignature = app.realSignatures.get(i);
             List<String> appVariable = app.realVariables.get(i);
