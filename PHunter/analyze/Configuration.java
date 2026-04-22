@@ -1,5 +1,8 @@
 package analyze;
 
+import java.util.LinkedHashSet;
+import java.util.Set;
+
 public class Configuration {
     public boolean enableDebugLevel = false;
     private String targetAPKFile = "";
@@ -8,6 +11,7 @@ public class Configuration {
     private String postBinary = "";
     private String threadNumber = "";
     private String patchFiles = "";
+    private String targetClasses = "";
 
     public Configuration() {
     }
@@ -19,6 +23,38 @@ public class Configuration {
 
     public void setPatchFiles(String patchFiles) {
         this.patchFiles = patchFiles;
+    }
+
+    public String getTargetClasses() {
+        return targetClasses;
+    }
+
+    public void setTargetClasses(String targetClasses) {
+        this.targetClasses = targetClasses;
+    }
+
+    public Set<String> getTargetClassesSet() {
+        Set<String> classes = new LinkedHashSet<>();
+        if (targetClasses == null || targetClasses.trim().isEmpty()) {
+            return classes;
+        }
+        String[] parts = targetClasses.split(",");
+        for (String part : parts) {
+            if (part == null) {
+                continue;
+            }
+            String className = part.trim();
+            if (className.endsWith(".*")) {
+                className = className.substring(0, className.length() - 2);
+            }
+            if (className.endsWith(".")) {
+                className = className.substring(0, className.length() - 1);
+            }
+            if (!className.isEmpty()) {
+                classes.add(className);
+            }
+        }
+        return classes;
     }
 
     public int getThreadNumber() {
