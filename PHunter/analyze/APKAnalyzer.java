@@ -57,7 +57,7 @@ public class APKAnalyzer extends Analyzer {
 
     private SootCallGraph analyze() throws IOException {
         initializeSoot();
-        SootCallGraph cg = new SootCallGraph(true);
+        SootCallGraph cg = new SootCallGraph(true, config.getTargetClassesSet());
         File inputFile = new File(config.getTargetAPKFile());
         PackManager.v().getPack("jtp").add(new Transform("jtp.apk", new CallGraphTransform(cg)));
         logger.info(String.format("Analyzing the apk %s", config.getTargetAPKFile()));
