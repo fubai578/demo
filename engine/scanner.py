@@ -86,6 +86,7 @@ class AndroidVulnScanner:
                 normalized_name=det.get("library_name", ""),
                 version=det.get("detected_version", ""),
                 similarity=det.get("similarity", 0.0),
+                target_classes=det.get("target_classes", []),
             )
             self.kb.match_cves(lib)
             self.context.libraries.append(lib)
@@ -145,7 +146,11 @@ class AndroidVulnScanner:
                     f"{vuln.cve_id} ..."
                 )
                 try:
-                    patch_result = run_phunter(str(self.context.path), cve_meta)
+                    patch_result = run_phunter(
+                        str(self.context.path),
+                        cve_meta,
+                        target_classes=lib.target_classes,
+                    )
 
                     if patch_result.get("hung"):
                         print(
@@ -215,6 +220,7 @@ class AndroidVulnScanner:
                 "library_name": lib.normalized_name,
                 "version": lib.version,
                 "similarity": lib.similarity,
+                "target_classes": list(lib.target_classes),
             })
             for vuln in lib.vulnerabilities:
                 vuln_key = (
