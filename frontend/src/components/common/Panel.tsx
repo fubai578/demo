@@ -8,10 +8,13 @@ interface PanelProps extends PropsWithChildren {
 
 export function Panel({ title, right, className = "", children }: PanelProps): JSX.Element {
   return (
-    <section className={`rounded-2xl border border-slate-700/70 bg-slate-900/55 p-5 shadow-[0_0_0_1px_rgba(70,85,120,0.2)] ${className}`}>
+    <section className={`rounded-2xl bg-gradient-to-br from-slate-900/40 to-slate-950/40 backdrop-blur-md border border-slate-700/30 p-6 shadow-[0_8px_32px_rgba(0,0,0,0.3)] hover-lift transition-all ${className}`}>
       {(title || right) && (
-        <header className="mb-4 flex items-center justify-between gap-4">
-          <div className="text-sm font-semibold tracking-wide text-slate-100">{title}</div>
+        <header className="mb-6 flex items-center justify-between gap-4 border-b border-slate-700/30 pb-4">
+          <div className="flex items-center gap-2">
+            <div className="h-1.5 w-1.5 rounded-full bg-cyan-500/70"></div>
+            <div className="text-sm font-semibold tracking-wide text-white">{title}</div>
+          </div>
           {right}
         </header>
       )}

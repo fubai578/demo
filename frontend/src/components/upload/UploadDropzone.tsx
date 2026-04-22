@@ -20,10 +20,10 @@ export function UploadDropzone({ file, onFileSelect, disabled = false }: UploadD
 
   return (
     <div
-      className={`relative rounded-2xl border-2 border-dashed p-8 transition ${
+      className={`relative rounded-2xl border-2 border-dashed p-8 transition backdrop-blur-sm ${
         dragging
-          ? "border-cyan-300 bg-cyan-500/10"
-          : "border-slate-600/70 bg-slate-950/55 hover:border-cyan-600/80"
+          ? "border-cyan-500/50 bg-cyan-500/20"
+          : "border-cyan-500/30 bg-cyan-500/10 hover:border-cyan-500/50 hover:bg-cyan-500/20"
       } ${disabled ? "opacity-70" : ""}`}
       onDragOver={(event) => {
         event.preventDefault();
@@ -53,17 +53,17 @@ export function UploadDropzone({ file, onFileSelect, disabled = false }: UploadD
       />
 
       <div className="pointer-events-none text-center">
-        <UploadCloud className="mx-auto h-11 w-11 text-cyan-200/80" />
-        <p className="mt-3 text-sm font-semibold text-slate-100">拖拽 APK 或点击选择文件</p>
-        <p className="mt-1 text-xs text-slate-400">保持现有后端协议，无需修改服务端。</p>
+        <UploadCloud className="mx-auto h-11 w-11 text-cyan-400" />
+        <p className="mt-3 text-base font-semibold text-white">拖拽 APK 或点击选择文件</p>
+        <p className="mt-2 text-sm text-cyan-300/80">保持现有后端协议，无需修改服务端。</p>
 
         {file && (
-          <div className="mx-auto mt-4 max-w-xl rounded-lg border border-slate-700/80 bg-slate-900/75 px-3 py-2 text-left">
-            <p className="inline-flex items-center gap-2 text-sm text-slate-100">
-              <FileArchive className="h-4 w-4 text-cyan-200" />
+          <div className="mx-auto mt-6 max-w-xl rounded-xl border border-emerald-500/30 bg-emerald-500/10 backdrop-blur-sm px-4 py-3 text-left">
+            <p className="inline-flex items-center gap-2 text-sm text-white">
+              <FileArchive className="h-4 w-4 text-emerald-400" />
               {file.name}
             </p>
-            <p className="mt-1 text-xs text-slate-400">{formatBytes(file.size)}</p>
+            <p className="mt-1 text-xs text-emerald-300">{formatBytes(file.size)}</p>
           </div>
         )}
       </div>

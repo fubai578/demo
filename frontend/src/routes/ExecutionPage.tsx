@@ -34,10 +34,10 @@ export function ExecutionPage(): JSX.Element {
   if (!taskId) {
     return (
       <Panel title="执行监控">
-        <p className="text-sm text-slate-300">任务 ID 缺失，请先前往新建任务页。</p>
+        <p className="text-sm text-zinc-500">任务 ID 缺失，请先前往新建任务页。</p>
         <Link
           to="/task/new"
-          className="mt-4 inline-flex rounded-lg border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100"
+          className="mt-6 inline-flex items-center gap-2 rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-5 py-3 text-sm text-zinc-200 transition-all hover:border-zinc-600/60 hover:bg-zinc-700/40 hover:text-white"
         >
           去新建任务
         </Link>
@@ -46,8 +46,8 @@ export function ExecutionPage(): JSX.Element {
   }
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[0.34fr_0.66fr]">
-      <div className="space-y-4">
+    <div className="grid gap-8 xl:grid-cols-[0.36fr_0.64fr]">
+      <div className="space-y-6">
         <ExecutionStatusPanel
           taskId={taskId}
           stage={taskStage}
@@ -60,28 +60,28 @@ export function ExecutionPage(): JSX.Element {
         />
 
         <Panel title="流程状态">
-          <div className="space-y-3 text-sm text-slate-300">
+          <div className="space-y-4 text-sm">
             <div className="flex items-center justify-between">
-              <span>任务阶段</span>
+              <span className="text-zinc-500">任务阶段</span>
               <StageBadge stage={taskStage} />
             </div>
             <div className="flex items-center justify-between">
-              <span>日志条数</span>
-              <span>{logs.length}</span>
+              <span className="text-zinc-500">日志条数</span>
+              <span className="text-zinc-300">{logs.length}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span>执行页恢复</span>
-              <span className="text-emerald-200">URL + localStorage</span>
+              <span className="text-zinc-500">执行页恢复</span>
+              <span className="text-zinc-300">URL + localStorage</span>
             </div>
           </div>
         </Panel>
 
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-3">
           <Link
             to={`/report/${taskId}`}
-            className="inline-flex items-center gap-1 rounded-lg border border-slate-500/60 bg-slate-700/35 px-3 py-2 text-xs text-slate-100"
+            className="inline-flex items-center gap-2 rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-5 py-3 text-sm text-zinc-200 transition-all hover:border-zinc-600/60 hover:bg-zinc-700/40 hover:text-white"
           >
-            <FileText className="h-3.5 w-3.5" />
+            <FileText className="h-4 w-4" />
             立即查看报告
           </Link>
           <button
@@ -89,15 +89,15 @@ export function ExecutionPage(): JSX.Element {
             onClick={() => {
               void connectExecution(taskId);
             }}
-            className="inline-flex items-center gap-1 rounded-lg border border-cyan-500/55 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100"
+            className="inline-flex items-center gap-2 rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-5 py-3 text-sm text-zinc-200 transition-all hover:border-zinc-600/60 hover:bg-zinc-700/40 hover:text-white"
           >
-            <ArrowRightCircle className="h-3.5 w-3.5" />
+            <ArrowRightCircle className="h-4 w-4" />
             重建监控连接
           </button>
         </div>
       </div>
 
-      <Panel title="实时终端" className="border-emerald-900/40 bg-[#020902]">
+      <Panel title="实时终端" className="bg-zinc-900/50">
         <LogTerminal logs={logs} />
       </Panel>
     </div>

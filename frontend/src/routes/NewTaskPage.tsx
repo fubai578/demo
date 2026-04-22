@@ -38,34 +38,34 @@ export function NewTaskPage(): JSX.Element {
           </div>
         }
       >
-        <p className="mb-4 text-sm leading-7 text-slate-300">
+        <p className="mb-6 text-base leading-8 text-zinc-400">
           上传 APK 后会自动调用 <code>/api/upload</code> 与 <code>/api/analyze</code>，并跳转到执行监控页。
         </p>
 
         <UploadDropzone file={selectedFile} onFileSelect={setSelectedFile} disabled={uploadState === "PENDING"} />
 
-        <div className="mt-4 flex flex-wrap items-center gap-3">
+        <div className="mt-6 flex flex-wrap items-center gap-3">
           <button
             type="button"
             disabled={!canStart}
             onClick={() => void startTask()}
-            className="inline-flex items-center gap-2 rounded-xl bg-cyan-400 px-4 py-2 font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+            className="inline-flex items-center gap-2 rounded-xl bg-cyber-gradient px-5 py-3 font-semibold text-white shadow-cyber-glow transition-all hover:scale-[1.02] hover:shadow-[0_0_30px_rgba(16,185,129,0.6),0_0_60px_rgba(16,185,129,0.3)] disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500 disabled:shadow-none disabled:hover:scale-100"
           >
             {uploadState === "PENDING" ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
             上传并开始扫描
           </button>
 
-          {selectedFile && <span className="text-xs text-slate-400">{selectedFile.name} · {formatBytes(selectedFile.size)}</span>}
+          {selectedFile && <span className="text-sm text-zinc-500">{selectedFile.name} · {formatBytes(selectedFile.size)}</span>}
         </div>
 
         {uploadContext && (
-          <div className="mt-4 rounded-xl border border-emerald-600/40 bg-emerald-900/20 px-3 py-2 text-xs text-emerald-100">
+          <div className="mt-4 rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-4 py-3 text-sm text-zinc-300">
             已上传：{uploadContext.fileName}（{formatBytes(uploadContext.size)}）
           </div>
         )}
 
         {errorMessage && (
-          <div className="mt-4 rounded-xl border border-rose-700/50 bg-rose-900/25 px-3 py-2 text-xs text-rose-100">
+          <div className="mt-4 rounded-xl border border-zinc-700/50 bg-zinc-800/40 px-4 py-3 text-sm text-zinc-300">
             {errorMessage}
           </div>
         )}
