@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -46,6 +47,16 @@ from utils.runner import CommandResult, run_command
 _DETECTION_PATTERN = re.compile(
     r"lib:\s*(?P<lib>[^\r\n]+)\s+similarity:\s*(?P<similarity>[0-9.]+)",
     re.IGNORECASE | re.MULTILINE,
+)
+_LIBHUNTER_BLOCK_PATTERN = re.compile(
+    r"(?ims)^\s*(?:lib|library)\s*:\s*.*?(?=^\s*(?:lib|library)\s*:|\Z)"
+)
+_LIBHUNTER_FIELD_LINE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9 _/\-]*\s*:")
+_CLASS_LIST_LINE_PATTERN = re.compile(
+    r"(?im)^\s*(?:class(?:\s*names?)?|classes?|class\s*names\s*/\s*packages?|packages?|package\s*names?)\s*:\s*(?P<value>.*)$"
+)
+_CLASS_TOKEN_PATTERN = re.compile(
+    r"^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$"
 )
 _PATCH_METHODS_PATTERN = re.compile(
     r"patch-related\s+method\s+count\s*=\s*(\d+)",
@@ -284,6 +295,14 @@ def run_logged_command(
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
+    def _safe_echo(line: str) -> None:
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            encoding = (getattr(sys.stdout, "encoding", None) or "utf-8")
+            safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            print(safe, flush=True)
+
     def _should_echo(line: str) -> bool:
         if not stream_output:
             return False
@@ -292,12 +311,12 @@ def run_logged_command(
     def _on_stdout(line: str) -> None:
         _append(stdout_log, line)
         if _should_echo(line):
-            print(line, flush=True)
+            _safe_echo(line)
 
     def _on_stderr(line: str) -> None:
         _append(stderr_log, line)
         if _should_echo(line):
-            print(line, flush=True)
+            _safe_echo(line)
 
     result = run_command(
         cmd,
@@ -316,19 +335,236 @@ def run_logged_command(
 
 
 def _parse_detection_text(text: str) -> list[dict]:
+    detections = _parse_detection_json(text)
+    if detections:
+        return detections
+
+    parsed: list[dict] = []
+    blocks = _LIBHUNTER_BLOCK_PATTERN.findall(text or "")
+    if blocks:
+        for block in blocks:
+            lib_match = re.search(
+                r"(?im)^\s*(?:lib|library)\s*:\s*(?P<lib>[^\r\n]+)",
+                block,
+            )
+            if not lib_match:
+                continue
+            raw_lib = lib_match.group("lib").strip()
+            similarity_match = re.search(
+                r"(?im)^\s*similarity\s*:\s*(?P<similarity>[0-9.]+)",
+                block,
+            )
+            similarity = float(similarity_match.group("similarity")) if similarity_match else 0.0
+            target_classes = _extract_target_classes_from_block(block)
+            normalized = normalize_libhunter_lib(raw_lib)
+            parsed.append({
+                "raw_lib": raw_lib,
+                "library_name": normalized["library_name"],
+                "detected_version": normalized["version"],
+                "similarity": similarity,
+                "target_classes": target_classes,
+            })
+    else:
+        for match in _DETECTION_PATTERN.finditer(text or ""):
+            raw_lib = match.group("lib").strip()
+            similarity = float(match.group("similarity"))
+            normalized = normalize_libhunter_lib(raw_lib)
+            parsed.append({
+                "raw_lib": raw_lib,
+                "library_name": normalized["library_name"],
+                "detected_version": normalized["version"],
+                "similarity": similarity,
+                "target_classes": [],
+            })
+
+    parsed.sort(key=lambda item: item["similarity"], reverse=True)
+    return parsed
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _normalize_class_token(token: str) -> str:
+    value = (token or "").strip().strip("\"'`")
+    if not value:
+        return ""
+    if value.startswith("L") and value.endswith(";"):
+        value = value[1:-1]
+    value = value.replace("/", ".")
+    if value.endswith(".*"):
+        value = value[:-2]
+    value = value.rstrip(".;").strip()
+    return value
+
+
+def _parse_class_candidates(raw_value: str) -> list[str]:
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return []
+
+    def _flatten(value: object) -> list[str]:
+        if isinstance(value, list):
+            flattened: list[str] = []
+            for item in value:
+                flattened.extend(_flatten(item))
+            return flattened
+        if value is None:
+            return []
+        return [str(value)]
+
+    parsed_items: list[str] = []
+    if raw_value.startswith("[") and raw_value.endswith("]"):
+        try:
+            loaded = json.loads(raw_value.replace("'", "\""))
+            parsed_items = _flatten(loaded)
+        except Exception:
+            inside = raw_value[1:-1]
+            parsed_items = re.split(r"[,;\n]+", inside)
+    else:
+        parsed_items = re.split(r"[,;\n]+", raw_value)
+
+    normalized: list[str] = []
+    for item in parsed_items:
+        candidate = _normalize_class_token(str(item).lstrip("-* ").strip())
+        if not candidate:
+            continue
+        if not _CLASS_TOKEN_PATTERN.match(candidate):
+            continue
+        normalized.append(candidate)
+    return _dedupe_preserve_order(normalized)
+
+
+def _extract_target_classes_from_block(block: str) -> list[str]:
+    if not block:
+        return []
+
+    classes: list[str] = []
+    lines = block.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = _CLASS_LIST_LINE_PATTERN.match(line)
+        if not match:
+            index += 1
+            continue
+        value = (match.group("value") or "").strip()
+        if value:
+            classes.extend(_parse_class_candidates(value))
+            index += 1
+            continue
+
+        index += 1
+        extra_lines: list[str] = []
+        while index < len(lines):
+            next_line = lines[index].strip()
+            lowered = next_line.lower()
+            if not next_line:
+                if extra_lines:
+                    break
+                index += 1
+                continue
+            if _LIBHUNTER_FIELD_LINE_PATTERN.match(next_line):
+                break
+            if lowered.startswith("similarity:") or lowered.startswith("time:"):
+                break
+            extra_lines.append(next_line.lstrip("-* ").strip())
+            index += 1
+        if extra_lines:
+            classes.extend(_parse_class_candidates(",".join(extra_lines)))
+
+    return _dedupe_preserve_order(classes)
+
+
+def _parse_detection_json(text: str) -> list[dict]:
+    source = (text or "").strip()
+    if not source:
+        return []
+    if not (source.startswith("{") or source.startswith("[")):
+        return []
+
+    try:
+        payload = json.loads(source)
+    except Exception:
+        return []
+
+    if isinstance(payload, dict):
+        rows = payload.get("detections")
+        if not isinstance(rows, list):
+            rows = payload.get("libraries")
+        if not isinstance(rows, list):
+            rows = [payload]
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        return []
+
     detections: list[dict] = []
-    for match in _DETECTION_PATTERN.finditer(text or ""):
-        raw_lib = match.group("lib").strip()
-        similarity = float(match.group("similarity"))
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_lib = str(
+            row.get("lib")
+            or row.get("library")
+            or row.get("name")
+            or row.get("raw_lib")
+            or ""
+        ).strip()
+        if not raw_lib:
+            continue
+
+        similarity_raw = row.get("similarity")
+        try:
+            similarity = float(similarity_raw) if similarity_raw is not None else 0.0
+        except (TypeError, ValueError):
+            similarity = 0.0
+
+        target_classes_raw = (
+            row.get("target_classes")
+            or row.get("classes")
+            or row.get("class_names")
+            or row.get("classNames")
+            or row.get("Class Names")
+            or row.get("Class Names/Packages")
+            or row.get("packages")
+            or row.get("package_names")
+        )
+        target_classes: list[str] = []
+        if isinstance(target_classes_raw, list):
+            for item in target_classes_raw:
+                target_classes.extend(_parse_class_candidates(str(item)))
+        elif target_classes_raw is not None:
+            target_classes = _parse_class_candidates(str(target_classes_raw))
+
         normalized = normalize_libhunter_lib(raw_lib)
         detections.append({
             "raw_lib": raw_lib,
             "library_name": normalized["library_name"],
             "detected_version": normalized["version"],
             "similarity": similarity,
+            "target_classes": _dedupe_preserve_order(target_classes),
         })
+
     detections.sort(key=lambda item: item["similarity"], reverse=True)
     return detections
+
+
+def _normalize_target_classes(target_classes: list[str] | None) -> list[str]:
+    if not target_classes:
+        return []
+    normalized: list[str] = []
+    for value in target_classes:
+        if value is None:
+            continue
+        normalized.extend(_parse_class_candidates(str(value)))
+    return _dedupe_preserve_order(normalized)
 
 
 def _is_cache_valid(pkl_path: Path, source_dex: Path) -> bool:
@@ -343,12 +579,15 @@ def _is_cache_valid(pkl_path: Path, source_dex: Path) -> bool:
 # 统计并清理缓存状态
 def warm_up_cache(tpl_dex_dir: Path, cache_dir: Path) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    dex_files = list(tpl_dex_dir.glob("*.dex"))
+    # Support nested layout: tpl_dex/<lib_name>/<version>.dex
+    dex_files = list(tpl_dex_dir.rglob("*.dex"))
     total = len(dex_files)
     cached = missing = stale = 0
 
     for dex in dex_files:
-        pkl = cache_dir / dex.with_suffix(".pkl").name
+        rel = dex.relative_to(tpl_dex_dir)
+        flat_name = str(rel).replace("/", "_").replace("\\", "_")
+        pkl = cache_dir / flat_name.replace(".dex", ".pkl")
         if not pkl.exists():
             missing += 1
         elif not _is_cache_valid(pkl, dex):
@@ -422,6 +661,11 @@ def run_libhunter(apk_path: str | Path) -> dict:
     env["LH_PICKLE_DIR"] = str(PICKLE_CACHE_DIR)
     env["LH_LIB_THRESHOLD"] = str(LIB_SIMILAR_THRESHOLD)
     env.setdefault("LH_EXEC_MODE", "mp")
+    env.setdefault("LH_PROBE_MAX_THRESHOLD", "0.5")
+    env.setdefault("LH_PROBE_MEAN_THRESHOLD", "0.35")
+    env.setdefault("LH_PROBE_COUNT", "3")
+    env.setdefault("LH_PROBE_PICK_STRATEGY", "old_mid_new")
+    env.setdefault("LH_PROBE_EMPTY_FALLBACK", "all")
     # 限制每个进程内的 BLAS/OMP 线程，避免多进程场景下线程数爆炸。
     # 把各种常见数值计算库线程数都限制成 1，比如 NumPy/OpenBLAS/MKL
     env.setdefault("OMP_NUM_THREADS", "1")
@@ -517,13 +761,13 @@ def run_libhunter(apk_path: str | Path) -> dict:
             "detections": [],
         }
 
-    result_file = next(
-        (f for f in (
-            output_dir / f"{apk_path.name}.txt",
-            output_dir / f"{apk_path.stem}.txt",
-        ) if f.exists()),
+    result_candidates = (
+        output_dir / f"{apk_path.name}.json",
+        output_dir / f"{apk_path.stem}.json",
         output_dir / f"{apk_path.name}.txt",
+        output_dir / f"{apk_path.stem}.txt",
     )
+    result_file = next((f for f in result_candidates if f.exists()), result_candidates[2])
 
     if result_file.exists():
         parsed_source = result_file.read_text(encoding="utf-8", errors="replace")
@@ -580,6 +824,7 @@ def build_phunter_cmd(
     post_patch_jar: Path | None = None,
     patch_diff: Path | None = None,
     thread_num: int | None = None,
+    target_classes: list[str] | None = None,
     java_opts: list[str] | None = None,
     cache_dir: Path | None = None,
     cache_mode: str | None = None,
@@ -587,6 +832,7 @@ def build_phunter_cmd(
     prewarm_apk_only: bool = False,
 ) -> list[str]:
     cmd = [str(JAVA_BIN)]
+    normalized_limit_classes = _normalize_target_classes(target_classes)
     if java_opts:
         cmd.extend(java_opts)
     cmd.extend(["-jar", str(PHUNTER_JAR)])
@@ -601,6 +847,8 @@ def build_phunter_cmd(
         cmd.extend(["--patchFiles", str(patch_diff)])
     if apk_path is not None:
         cmd.extend(["--targetAPK", str(apk_path)])
+    if normalized_limit_classes:
+        cmd.extend(["--limitClasses", ",".join(normalized_limit_classes)])
     if cache_dir is not None:
         cmd.extend(["--cacheDir", str(cache_dir)])
     if cache_mode:
@@ -734,7 +982,11 @@ def prewarm_phunter_apk_cache(apk_path: str | Path) -> dict:
     return {"status": "failed", "returncode": result.returncode, "stderr": result.stderr}
 
 
-def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
+def run_phunter(
+    apk_path: str | Path,
+    cve_meta: dict,
+    target_classes: list[str] | None = None,
+) -> dict:
     apk_path = Path(apk_path).expanduser().resolve()
     pre_patch_jar = Path(cve_meta["pre_patch_jar"]).expanduser().resolve()
     post_patch_jar = Path(cve_meta["post_patch_jar"]).expanduser().resolve()
@@ -751,6 +1003,7 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
 
     cve_id = cve_meta["cve_id"]
     thread_num = int(cve_meta.get("thread_num", DEFAULT_PHUNTER_THREADS))
+    normalized_target_classes = _normalize_target_classes(target_classes)
     java_opts = shlex.split(os.getenv("PHUNTER_JAVA_OPTS", ""))
 
     cmd = build_phunter_cmd(
@@ -759,6 +1012,7 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         post_patch_jar=post_patch_jar,
         patch_diff=patch_diff,
         thread_num=thread_num,
+        target_classes=normalized_target_classes,
         java_opts=java_opts,
         cache_dir=PHUNTER_CACHE_DIR,
         cache_mode=PHUNTER_CACHE_MODE,
@@ -787,6 +1041,7 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
             "patch_related_method_count": None,
             "pre_similarity": None,
             "post_similarity": None,
+            "target_classes": normalized_target_classes,
             "raw_stdout": result.stdout,
             "raw_stderr": result.stderr,
         }
@@ -811,6 +1066,7 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
             post_patch_jar=post_patch_jar,
             patch_diff=patch_diff,
             thread_num=retry_thread_num,
+            target_classes=normalized_target_classes,
             java_opts=retry_java_opts,
             cache_dir=PHUNTER_CACHE_DIR,
             cache_mode=PHUNTER_CACHE_MODE,
@@ -837,6 +1093,7 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
                 "patch_related_method_count": None,
                 "pre_similarity": None,
                 "post_similarity": None,
+                "target_classes": normalized_target_classes,
                 "raw_stdout": retry_result.stdout,
                 "raw_stderr": retry_result.stderr,
                 "retried": True,
@@ -870,6 +1127,7 @@ def run_phunter(apk_path: str | Path, cve_meta: dict) -> dict:
         "patch_related_method_count": patch_related_method_count,
         "pre_similarity": pre_similarity,
         "post_similarity": post_similarity,
+        "target_classes": normalized_target_classes,
         "raw_stdout": result.stdout,
         "raw_stderr": result.stderr,
         "retried": retried,
