@@ -26,6 +26,7 @@ class TPLibrary:
     normalized_name: str
     version: str
     similarity: float
+    target_classes: List[str] = field(default_factory=list)
 
     vulnerabilities: List[Vulnerability] = field(default_factory=list)
 
