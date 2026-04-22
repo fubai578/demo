@@ -22,14 +22,25 @@ detect_type = "lib_version"
 
 class_similar  = 1
 method_similar = 0.75
-lib_similar    = float(os.environ.get("LH_LIB_THRESHOLD", "0.85"))  # 不再硬编码 0.1
+lib_similar    = 0.1
+
 
 log_file = "log.txt"
 
 
 def clear_log():
-    if os.path.exists(log_file):
+    if not os.path.exists(log_file):
+        return
+    try:
         os.remove(log_file)
+    except OSError:
+        # On Windows, the log file may still be held by another process/thread.
+        # Logging cleanup should never abort the whole detection workflow.
+        try:
+            with open(log_file, "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
 
 
 def setup_logger():
