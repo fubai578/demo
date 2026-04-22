@@ -11,6 +11,9 @@ import java.util.concurrent.ConcurrentHashMap;
 public class SootCallGraph {
 
     boolean isAPK;
+    private final Set<String> targetClasses;
+    private final Set<String> targetPackagePrefixes;
+    private final boolean limitToTargetClasses;
 
     ConcurrentHashMap<SootMethod, List<SootMethod>> callSites = new ConcurrentHashMap<>();
 
@@ -23,19 +26,94 @@ public class SootCallGraph {
     ConcurrentHashMap<SootMethod, MethodAttr> sootMethodMethodAttrMap = new ConcurrentHashMap<>();
 
     public SootCallGraph(boolean isAPK) {
+        this(isAPK, Collections.emptySet());
+    }
+
+    public SootCallGraph(boolean isAPK, Set<String> targetClasses) {
         this.isAPK = isAPK;
+        this.targetClasses = normalizeTargets(targetClasses);
+        this.targetPackagePrefixes = buildTargetPackagePrefixes(this.targetClasses);
+        this.limitToTargetClasses = !this.targetClasses.isEmpty();
     }
 
     public void buildSootCallGraph() {
-        for (SootClass clazz : Scene.v().getClasses()) {
-            if (!isAndroidFrameworkCall(clazz.getName()))
-                allSootClasses.add(clazz);
+        if (isAPK) {
+            for (SootClass clazz : Scene.v().getApplicationClasses()) {
+                if (shouldAnalyzeApplicationClass(clazz)) {
+                    allSootClasses.add(clazz);
+                }
+            }
+        } else {
+            for (SootClass clazz : Scene.v().getClasses()) {
+                if (!isAndroidFrameworkCall(clazz.getName()))
+                    allSootClasses.add(clazz);
+            }
         }
         genSubClassGraph();
         for (SootClass c : this.allSootClasses) {
             for (SootMethod m : c.getMethods())
                 handleEachMethod(m);
         }
+    }
+
+    private Set<String> normalizeTargets(Set<String> rawTargets) {
+        Set<String> normalized = new LinkedHashSet<>();
+        if (rawTargets == null || rawTargets.isEmpty()) {
+            return normalized;
+        }
+        for (String target : rawTargets) {
+            if (target == null) {
+                continue;
+            }
+            String value = target.trim();
+            if (value.endsWith(".*")) {
+                value = value.substring(0, value.length() - 2);
+            }
+            if (value.endsWith(".")) {
+                value = value.substring(0, value.length() - 1);
+            }
+            if (!value.isEmpty()) {
+                normalized.add(value);
+            }
+        }
+        return normalized;
+    }
+
+    private Set<String> buildTargetPackagePrefixes(Set<String> targets) {
+        Set<String> prefixes = new LinkedHashSet<>();
+        for (String target : targets) {
+            if (target == null || target.isEmpty()) {
+                continue;
+            }
+            prefixes.add(target + ".");
+            int lastDot = target.lastIndexOf('.');
+            if (lastDot > 0) {
+                prefixes.add(target.substring(0, lastDot + 1));
+            }
+        }
+        return prefixes;
+    }
+
+    private boolean shouldAnalyzeApplicationClass(SootClass clazz) {
+        if (!clazz.isApplicationClass()) {
+            return false;
+        }
+        String className = clazz.getName();
+        if (isAndroidFrameworkCall(className)) {
+            return false;
+        }
+        if (!limitToTargetClasses) {
+            return true;
+        }
+        if (targetClasses.contains(className)) {
+            return true;
+        }
+        for (String packagePrefix : targetPackagePrefixes) {
+            if (className.startsWith(packagePrefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public void genSubClassGraph() {
