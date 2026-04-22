@@ -10,19 +10,18 @@ import sys
 import time
 import traceback
 from collections import Counter
-from functools import partial
-from multiprocessing import Pool, Manager, Process
+from multiprocessing import Pool
+from typing import Dict, List
 
 import Levenshtein
 import networkx as nx
 from tqdm import tqdm
 
 from apk import Apk
-from coarse_filter import CoarseFilterConfig, CoarseFilterEngine, build_lib_groups
-from lh_config import (class_similar, lib_similar, max_thread_num, method_similar, pickle_dir,
-                    listener_process, worker_init, setup_logger)
+from analyzer_stage import _aggregate_stage2_peaks, _run_stage1_probe_discovery, _write_libhunter_reports
+from lh_config import class_similar, lib_similar, max_thread_num, method_similar, pickle_dir, setup_logger
 from lib import ThirdLib
-from util import split_list_n_list
+from lib_groups import build_lib_groups
 abstract_method_weight =3
 
 
@@ -779,7 +778,7 @@ def fine_match(apk_obj, lib_obj, lib_class_match_dict, LOGGER):
     return lib_class_match_result
 
 
-def detect(apk_obj, lib_obj, LOGGER):
+def detect(apk_obj, lib_obj, LOGGER, return_details: bool = False):
     '''
     Detecting library information contained in an apk
     :param apk_obj: build apk object
@@ -787,15 +786,23 @@ def detect(apk_obj, lib_obj, LOGGER):
     :param lib_obj: The library object to build.
     :return: Dictionary to return detection results
     '''
+    lib_name = getattr(lib_obj, "lib_name", "")
     if len(lib_obj.classes_dict) == 0:
+        if return_details:
+            return {
+                "library_name": lib_name,
+                "matched": False,
+                "score": 0.0,
+                "similarity": 0.0,
+                "target_classes": [],
+                "stage": "empty",
+            }
         return {}
 
     lib_opcode_num = lib_obj.lib_opcode_num
     lib_classes_dict = lib_obj.classes_dict
 
     result = {}
-    avg_filter_rate = 0
-    avg_time = 0
 
     filter_result = pre_match(apk_obj, lib_obj, LOGGER)
     pre_match_opcodes = 0
@@ -815,9 +822,19 @@ def detect(apk_obj, lib_obj, LOGGER):
         LOGGER.debug("-------------------------------")
 
     # Determine if the pre-match result does not contain
-    pre_match_rate = pre_match_opcodes / lib_opcode_num
+    pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0.0
     if pre_match_rate < lib_similar:
         LOGGER.debug("Pre-match failed library: %s, pre-match rate is: %f", lib_obj.lib_name, pre_match_rate)
+        if return_details:
+            return {
+                "library_name": lib_name,
+                "matched": False,
+                "score": float(pre_match_rate),
+                "similarity": float(pre_match_rate),
+                "target_classes": [],
+                "stage": "pre_match",
+                "pre_match_rate": float(pre_match_rate),
+            }
         return {}
 
     # avg_filter_rate += filter_rate
@@ -857,7 +874,7 @@ def detect(apk_obj, lib_obj, LOGGER):
             # print("FN fine lib_class: ", lib_class)
             LOGGER.debug("lib_class: %s" % lib_class)
 
-    lib_coarse_match_rate = lib_coarse_match_opcode_num / lib_opcode_num
+    lib_coarse_match_rate = lib_coarse_match_opcode_num / lib_opcode_num if lib_opcode_num > 0 else 0.0
     LOGGER.debug("Number of all opcodes in class matched by lib coarse-graining: %d", lib_coarse_match_opcode_num)
     LOGGER.debug("lib coarse-grained rate: %f", lib_coarse_match_rate)
     LOGGER.debug("Number of matched classes in library: %d", len(lib_match_classes) + len(abstract_lib_match_classes))
@@ -866,6 +883,17 @@ def detect(apk_obj, lib_obj, LOGGER):
 
     if lib_coarse_match_rate < lib_similar:
         LOGGER.debug("Coarse match failed library: %s, coarse match rate is: %f", lib_obj.lib_name, lib_coarse_match_rate)
+        if return_details:
+            return {
+                "library_name": lib_name,
+                "matched": False,
+                "score": float(lib_coarse_match_rate),
+                "similarity": float(lib_coarse_match_rate),
+                "target_classes": [],
+                "stage": "coarse_match",
+                "pre_match_rate": float(pre_match_rate),
+                "coarse_match_rate": float(lib_coarse_match_rate),
+            }
         return {}
 
     # Perform fine-grained matching
@@ -893,9 +921,29 @@ def detect(apk_obj, lib_obj, LOGGER):
     if lib_obj.interface_lib:
         min_lib_match = 1.0
 
-    temp_list = [final_match_opcodes, lib_opcode_num, final_match_opcodes / lib_opcode_num]
-    if final_match_opcodes / lib_opcode_num >= min_lib_match:
+    final_similarity = (final_match_opcodes / lib_opcode_num) if lib_opcode_num > 0 else 0.0
+    temp_list = [final_match_opcodes, lib_opcode_num, final_similarity]
+    if final_similarity >= min_lib_match:
         result[lib_obj.lib_name] = temp_list
+
+    if return_details:
+        target_classes = sorted({
+            str(info[0]).strip()
+            for info in lib_class_match_result.values()
+            if isinstance(info, (list, tuple)) and len(info) > 0 and str(info[0]).strip()
+        })
+        return {
+            "library_name": lib_name,
+            "matched": final_similarity >= min_lib_match,
+            "score": float(final_similarity),
+            "similarity": float(final_similarity),
+            "target_classes": target_classes,
+            "stage": "fine_match",
+            "pre_match_rate": float(pre_match_rate),
+            "coarse_match_rate": float(lib_coarse_match_rate),
+            "final_match_opcodes": int(final_match_opcodes),
+            "lib_opcode_num": int(lib_opcode_num),
+        }
     return result
 
 
@@ -954,6 +1002,8 @@ def init_worker():
         logger.removeHandler(handler)
 
 
+
+
 def _load_or_build_lib_obj(lib_dex_folder: str, lib: str, logger):
     # 扁平化 pickle 名称以支持嵌套目录结构
     flat_lib_name = lib.replace("/", "_").replace("\\", "_")
@@ -993,142 +1043,18 @@ def _init_detect_worker(apk_pickle_path: str):
         _DETECT_APK_OBJ = pickle.load(file)
 
 
-def _init_coarse_engine(lib_dex_folder: str, lib_groups: dict, logger):
-    config = CoarseFilterConfig.from_env()
-    if not config.enabled:
-        return None
-
-    coarse_engine = CoarseFilterEngine(
-        lib_dex_folder=lib_dex_folder,
-        load_lib_obj=lambda rel_path: _load_or_build_lib_obj(lib_dex_folder, rel_path, logger),
-        logger=logger,
-        config=config,
-    )
-    stats = coarse_engine.ensure_index(lib_groups)
-    logger.info(
-        "[libhunter] Coarse index ready: total=%d reused=%d rebuilt=%d elapsed=%dms",
-        stats.get("total_families", 0),
-        stats.get("reused_families", 0),
-        stats.get("rebuilt_families", 0),
-        stats.get("elapsed_ms", 0),
-    )
-    return coarse_engine
+def _extract_family_from_rel_path(rel_path: str) -> str:
+    norm = (rel_path or "").replace("\\", "/").strip("/")
+    folder = os.path.dirname(norm)
+    return folder.replace("/", ".") if folder else ""
 
 
-def _log_coarse_metrics(logger, metrics: dict):
-    total_groups = metrics.get("coarse_total_groups", 0)
-    candidate_groups = metrics.get("coarse_candidate_groups", 0)
-    prune_ratio = metrics.get("coarse_prune_ratio", 0.0)
-    elapsed_ms = metrics.get("coarse_elapsed_ms", 0)
-    fallback_triggered = metrics.get("fallback_triggered", False)
-    api_tokens_before = metrics.get("api_tokens_before", 0)
-    api_tokens_after = metrics.get("api_tokens_after", 0)
-    rerank_keep_count = metrics.get("rerank_keep_count", 0)
-    string_quality = metrics.get("string_quality", {}) or {}
-    adaptive_weights = metrics.get("adaptive_weights", {}) or {}
-
-    logger.info("[libhunter] coarse_total_groups=%d", total_groups)
-    logger.info("[libhunter] coarse_candidate_groups=%d", candidate_groups)
-    logger.info("[libhunter] coarse_prune_ratio=%.4f", prune_ratio)
-    logger.info("[libhunter] coarse_elapsed_ms=%d", elapsed_ms)
-    logger.info("[libhunter] fallback_triggered=%s", fallback_triggered)
-    logger.info("[libhunter] api_tokens_before=%d", api_tokens_before)
-    logger.info("[libhunter] api_tokens_after=%d", api_tokens_after)
-    logger.info("[libhunter] rerank_keep_count=%d", rerank_keep_count)
-    if string_quality:
-        logger.info(
-            "[libhunter] string_quality=q_str=%.4f low=%s long_ratio=%.4f entropy_ratio=%.4f printable_ratio=%.4f",
-            float(string_quality.get("q_str", 0.0)),
-            bool(string_quality.get("is_low_quality", False)),
-            float(string_quality.get("long_ratio", 0.0)),
-            float(string_quality.get("high_entropy_ratio", 0.0)),
-            float(string_quality.get("printable_ratio", 0.0)),
-        )
-    if adaptive_weights:
-        logger.info(
-            "[libhunter] adaptive_weights=w_str=%.4f w_api=%.4f smooth=%s",
-            float(adaptive_weights.get("w_str", 0.0)),
-            float(adaptive_weights.get("w_api", 0.0)),
-            bool(adaptive_weights.get("smooth", False)),
-        )
-    logger.info(
-        "[libhunter] Coarse filter: %d -> %d groups (pruned %.1f%%), %dms",
-        total_groups,
-        candidate_groups,
-        prune_ratio * 100.0,
-        elapsed_ms,
-    )
-
-
-# ==========================================
-# 新增：启发式剪枝核心：基于 prematch 的探针检测任务
-# ==========================================
-def _probe_group_task(args):
-    """
-    稳定多进程模式探针：仅执行 pre_match (模糊签名及 Bloom Filter)。
-    如果匹配率低于阈值，则直接判定不包含该组件库。
-    """
-    lib_dex_folder, probe_lib, base_name = args
-    logger = _DETECT_LOGGER if _DETECT_LOGGER is not None else setup_logger()
-    if _DETECT_APK_OBJ is None:
-        return base_name, False
-
-    lib_obj = _load_or_build_lib_obj(lib_dex_folder, probe_lib, logger)
-    if lib_obj is None or len(lib_obj.classes_dict) == 0:
-        return base_name, False
-
-    # 仅执行最轻量的粗筛
-    filter_result = pre_match(_DETECT_APK_OBJ, lib_obj, logger)
-    pre_match_opcodes = 0
-    lib_classes_dict = lib_obj.classes_dict
-
-    for lib_class in filter_result:
-        if len(lib_classes_dict[lib_class]) == 2:
-            pre_match_opcodes += (len(lib_classes_dict[lib_class][0]) * abstract_method_weight)
-        else:
-            pre_match_opcodes += lib_classes_dict[lib_class][2]
-
-    lib_opcode_num = lib_obj.lib_opcode_num
-    pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0
-
-    # 探针预筛阈值，直接与 lib_similar 对齐或设为 0.25 (取小者)
-    probe_threshold = 0.8
-    is_suspected = pre_match_rate >= probe_threshold
-    
-    return base_name, is_suspected
-
-
-def sub_probe_lib_legacy(lib, apk, global_apk_info_dict, global_lib_info_dict, shared_matched_groups, base_name_mapping):
-    """
-    Legacy 模式探针：仅执行 pre_match (模糊签名及 Bloom Filter)。
-    """
-    logger = setup_logger()
-    if lib not in global_lib_info_dict:
-        return
-    lib_obj = global_lib_info_dict[lib]
-    apk_obj = global_apk_info_dict[apk]
-
-    if len(lib_obj.classes_dict) == 0:
-        return
-
-    filter_result = pre_match(apk_obj, lib_obj, logger)
-    pre_match_opcodes = 0
-    lib_classes_dict = lib_obj.classes_dict
-
-    for lib_class in filter_result:
-        if len(lib_classes_dict[lib_class]) == 2:
-            pre_match_opcodes += (len(lib_classes_dict[lib_class][0]) * abstract_method_weight)
-        else:
-            pre_match_opcodes += lib_classes_dict[lib_class][2]
-
-    lib_opcode_num = lib_obj.lib_opcode_num
-    pre_match_rate = pre_match_opcodes / lib_opcode_num if lib_opcode_num > 0 else 0
-    probe_threshold = 0.8
-
-    if pre_match_rate >= probe_threshold:
-        base_name = base_name_mapping[lib]
-        shared_matched_groups[base_name] = True
-
+def _extract_version_from_rel_path(rel_path: str) -> str:
+    filename = os.path.basename(rel_path or "")
+    stem = filename[:-4] if filename.endswith(".dex") else filename
+    if "_" in stem:
+        return stem.split("_", 1)[1]
+    return stem
 
 def _detect_one_lib_task(args):
     lib_dex_folder, lib = args
@@ -1148,15 +1074,88 @@ def _detect_one_lib_task(args):
     return result if len(result) != 0 else None
 
 
+def _detect_one_lib_detail_task(args):
+    lib_dex_folder, lib = args
+    logger = _DETECT_LOGGER if _DETECT_LOGGER is not None else setup_logger()
+    if _DETECT_APK_OBJ is None:
+        return None
+
+    lib_obj = _load_or_build_lib_obj(lib_dex_folder, lib, logger)
+    if lib_obj is None:
+        return None
+
+    try:
+        detail = detect(_DETECT_APK_OBJ, lib_obj, logger, return_details=True)
+    except Exception as e:
+        logger.error("Error in stage2 detect lib %s: %s", lib, e)
+        return None
+
+    if not isinstance(detail, dict):
+        return None
+
+    lib_name = str(detail.get("library_name", "")).strip() or str(getattr(lib_obj, "lib_name", "")).strip() or str(lib)
+    return {
+        "library_family": _extract_family_from_rel_path(lib),
+        "selected_version": _extract_version_from_rel_path(lib),
+        "lib": lib_name,
+        "similarity": float(detail.get("similarity", detail.get("score", 0.0)) or 0.0),
+        "matched": bool(detail.get("matched", False)),
+        "target_classes": sorted({
+            str(cls).strip()
+            for cls in (detail.get("target_classes", []) or [])
+            if str(cls).strip()
+        }),
+    }
+
+
+def _run_stage2_for_candidate_versions(
+    *,
+    lib_dex_folder: str,
+    apk_pickle_path: str,
+    candidate_versions: List[str],
+    thread_num: int,
+    apk_label: str,
+    logger,
+) -> List[dict]:
+    if not candidate_versions:
+        return []
+
+    detect_tasks = [(lib_dex_folder, rel) for rel in sorted(set(candidate_versions))]
+    details: List[dict] = []
+    try:
+        with Pool(
+            processes=thread_num,
+            initializer=_init_detect_worker,
+            initargs=(apk_pickle_path,),
+        ) as pool:
+            for row in tqdm(
+                pool.imap_unordered(_detect_one_lib_detail_task, detect_tasks),
+                total=len(detect_tasks),
+                desc=f"Stage2 {apk_label}",
+                colour='blue',
+            ):
+                if row:
+                    details.append(row)
+    except (PermissionError, OSError, RuntimeError) as e:
+        logger.warning("Pool init failed in stage2, fallback to serial mode: %s", e)
+        _init_detect_worker(apk_pickle_path)
+        for task in tqdm(
+            detect_tasks,
+            total=len(detect_tasks),
+            desc=f"Stage2 {apk_label} (serial)",
+            colour='blue',
+        ):
+            row = _detect_one_lib_detail_task(task)
+            if row:
+                details.append(row)
+    return details
+
+
 def _search_libs_in_app_multiprocess(lib_dex_folder=None,
                                      apk_folder=None,
                                      output_folder='outputs',
                                      processes=None):
-    """
-    稳定多进程模式：不使用 multiprocessing.Manager 共享大对象，
-    以“文件缓存 + 子进程返回结果”替代，避免 BrokenPipe/EOFError。
-    并引入两阶段启发式剪枝（Prematch 探针筛选 -> 全量版本比对）。
-    """
+    """Two-stage LibHunter pipeline in stable multiprocessing mode."""
     to_analysze_apks = os.listdir(apk_folder)
     print("num of apk to analyze: ", len(to_analysze_apks))
     LOGGER = setup_logger()
@@ -1168,23 +1167,25 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
 
     LOGGER.debug("Starting to extract all library information...")
     time_start = datetime.datetime.now()
-    
+
     lib_groups = build_lib_groups(lib_dex_folder)
     libs_list = [lib for versions in lib_groups.values() for lib in versions]
-
-    libs = list(libs_list)  # 用于兼容后面的代码
+    libs = list(libs_list)
     random.shuffle(libs)
 
     decompile_thread_num = min(thread_num, len(libs)) if len(libs) > 0 else 1
     if len(libs) > 0:
         tasks = [(lib_dex_folder, lib) for lib in libs]
-        with Pool(processes=decompile_thread_num, initializer=init_worker) as pool:
-            # 触发所有 TPL 的 pickle 预构建/校验
-            for _ in pool.imap_unordered(_build_lib_pickle_task, tasks):
-                pass
+        try:
+            with Pool(processes=decompile_thread_num, initializer=init_worker) as pool:
+                for _ in pool.imap_unordered(_build_lib_pickle_task, tasks):
+                    pass
+        except (PermissionError, OSError, RuntimeError) as e:
+            LOGGER.warning("Pool init failed in prebuild stage, fallback to serial mode: %s", e)
+            for task in tasks:
+                _build_lib_pickle_task(task)
 
     print("All TPL information extracted ...")
-
     time_end = datetime.datetime.now()
     LOGGER.debug("All libraries extracted (multiprocess stable), time: %d", (time_end - time_start).seconds)
 
@@ -1193,13 +1194,6 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
 
     all_libs_num = len(libs_list)
     LOGGER.info("The number of libraries analyzed this time is: %d", all_libs_num)
-
-    coarse_engine = None
-    try:
-        coarse_engine = _init_coarse_engine(lib_dex_folder, lib_groups, LOGGER)
-    except Exception as e:
-        LOGGER.error("[libhunter] coarse index initialization failed, fallback to full scan: %s", e)
-        coarse_engine = None
 
     for apk in os.listdir(apk_folder):
         print("start analyzing: ", apk)
@@ -1212,63 +1206,62 @@ def _search_libs_in_app_multiprocess(lib_dex_folder=None,
                 apk_obj = Apk(apk_folder + "/" + apk, LOGGER)
                 pickle.dump(apk_obj, open(apk_pickle_path, 'wb'))
             else:
-                # 读取一次用于提前校验 pickle 是否可用
                 with open(apk_pickle_path, 'rb') as file:
                     apk_obj = pickle.load(file)
         except Exception as e:
             LOGGER.error("Error in decompile apk: %s", e)
             continue
 
-        global_finished_jar_dict = {}
+        stage1_start = datetime.datetime.now()
+        stage1 = _run_stage1_probe_discovery(
+            apk_obj=apk_obj,
+            lib_groups=lib_groups,
+            load_lib_obj=lambda rel: _load_or_build_lib_obj(lib_dex_folder, rel, LOGGER),
+            logger=LOGGER,
+        )
+        stage1_time = (datetime.datetime.now() - stage1_start).seconds
 
-        if len(libs_list) > 0:
-            matched_groups = set(lib_groups.keys())
-            coarse_metrics = {
-                "coarse_total_groups": len(lib_groups),
-                "coarse_candidate_groups": len(matched_groups),
-                "coarse_prune_ratio": 0.0,
-                "coarse_elapsed_ms": 0,
-                "fallback_triggered": False,
-            }
-            if coarse_engine is not None:
-                matched_groups, coarse_metrics = coarse_engine.select_candidate_groups(apk_obj, lib_groups)
-            _log_coarse_metrics(LOGGER, coarse_metrics)
+        candidate_versions: List[str] = []
+        for family in stage1.get("admitted_families", []):
+            candidate_versions.extend(lib_groups.get(family, []))
+        candidate_versions = sorted(set(candidate_versions))
+        if not candidate_versions:
+            LOGGER.warning("[libhunter] stage1 yielded no candidates for %s", apk)
+            if not stage1.get("fallback_triggered", False):
+                LOGGER.warning("[libhunter] recall risk: candidate set is empty and fallback is disabled")
 
-            detect_tasks = []
-            for base_name in matched_groups:
-                for lib in lib_groups[base_name]:
-                    detect_tasks.append((lib_dex_folder, lib))
+        stage2_start = datetime.datetime.now()
+        version_details = _run_stage2_for_candidate_versions(
+            lib_dex_folder=lib_dex_folder,
+            apk_pickle_path=apk_pickle_path,
+            candidate_versions=candidate_versions,
+            thread_num=thread_num,
+            apk_label=apk,
+            logger=LOGGER,
+        )
+        stage2_time = (datetime.datetime.now() - stage2_start).seconds
+        stage2 = _aggregate_stage2_peaks(version_details, stage1)
 
-            if len(detect_tasks) > 0:
-                LOGGER.info(f"[+] 进入细筛组件族: {len(matched_groups)}，版本任务数: {len(detect_tasks)}")
-                with Pool(
-                    processes=thread_num,
-                    initializer=_init_detect_worker,
-                    initargs=(apk_pickle_path,),
-                ) as pool:
-                    for result in tqdm(
-                        pool.imap_unordered(_detect_one_lib_task, detect_tasks),
-                        total=len(detect_tasks),
-                        desc=f"Detect {apk}",
-                        colour='blue',
-                    ):
-                        if result:
-                            global_finished_jar_dict.update(result)
-
-        LOGGER.info("-------------------------------------------------------------------")
-        LOGGER.info("Detailed detection information for all libraries included is as follows:")
-        for lib, infos in global_finished_jar_dict.items():
-            LOGGER.info("%s  :  %f   %f   %f", lib, infos[0], infos[1], infos[2])
-        LOGGER.info("-------------------------------------------------------------------")
+        LOGGER.info(
+            "[libhunter] %s stage1_families=%d/%d stage2_versions=%d detections=%d stage1_time=%ss stage2_time=%ss",
+            apk,
+            stage1.get("candidate_families", 0),
+            stage1.get("total_families", 0),
+            len(candidate_versions),
+            len(stage2.get("detections", [])),
+            stage1_time,
+            stage2_time,
+        )
 
         apk_time_end = datetime.datetime.now()
         apk_time = (apk_time_end - apk_time_start).seconds
-        with open(output_folder + "/" + apk + ".txt", "w", encoding="utf-8") as result:
-            for lib in sorted(global_finished_jar_dict.keys()):
-                result.write("lib: " + lib + "\n")
-                result.write("similarity: " + str(global_finished_jar_dict[lib][2]) + "\n\n")
-            result.write("time: " + str(apk_time) + "s")
-
+        _write_libhunter_reports(
+            output_folder=output_folder,
+            apk_name=apk,
+            stage1=stage1,
+            stage2=stage2,
+            apk_time_seconds=apk_time,
+        )
         LOGGER.info("Current apk analysis time: %d (in seconds)", apk_time)
 
 
@@ -1277,174 +1270,14 @@ def search_libs_in_app(lib_dex_folder=None,
                        output_folder='outputs',
                        processes=None):
     exec_mode = os.environ.get("LH_EXEC_MODE", "mp").lower()
-    if exec_mode != "legacy":
-        return _search_libs_in_app_multiprocess(
-            lib_dex_folder=lib_dex_folder,
-            apk_folder=apk_folder,
-            output_folder=output_folder,
-            processes=processes,
-        )
-
-    to_analysze_apks = os.listdir(apk_folder)
-    print("num of apk to analyze: ", len(to_analysze_apks))
-    LOGGER = setup_logger()
-
-    thread_num = processes if processes != None else max_thread_num
-    LOGGER.info("Analyzing maximum number of cpu used: %d", thread_num)
-
-    LOGGER.debug("Starting to extract all library information...")
-    time_start = datetime.datetime.now()
-    
-    lib_groups = build_lib_groups(lib_dex_folder)
-    libs_list = [lib for versions in lib_groups.values() for lib in versions]
-
-    libs = list(libs_list)
-    random.shuffle(libs)
-    
-    with Manager() as manager:
-        log_queue1 = manager.Queue()
-
-        global_lib_info_dict = manager.dict()
-        decompile_thread_num = min(thread_num, len(libs))
-        sub_lists = split_list_n_list(libs, decompile_thread_num)
-
-        listener1 = Process(target=listener_process, args=(log_queue1,))
-        listener1.start()
-
-        with Pool(processes=decompile_thread_num, initializer=worker_init, initargs=(log_queue1,)) as pool:
-            tasks_method_maps = [
-                pool.apply_async(sub_method_map_decompile,
-                                 (lib_dex_folder, sub_libs, global_lib_info_dict))
-                for sub_libs in sub_lists
-            ]
-
-            for task in tasks_method_maps:
-                task.get()
-
-        # Stop the listener
-        log_queue1.put(None)
-        listener1.join()
-
-        log_queue2 = manager.Queue()
-        listener2 = Process(target=listener_process, args=(log_queue2,))
-        listener2.start()
-
-        with Pool(processes=decompile_thread_num, initializer=worker_init, initargs=(log_queue2,)) as pool:
-            # Part II: Library decompilation to extract information
-            tasks_decompile = [
-                pool.apply_async(sub_decompile_lib, (
-                    lib_dex_folder, sub_libs, global_lib_info_dict))
-                for sub_libs in sub_lists
-            ]
-
-            # Wait for all library decompilation tasks to complete
-            for task in tasks_decompile:
-                task.get()
-
-        # Stop the listener
-        log_queue2.put(None)
-        listener2.join()
-        print("All TPL information extracted ...")
-
-        time_end = datetime.datetime.now()
-        LOGGER.debug("All libraries extracted, time: %d", (time_end - time_start).seconds)
-
-        finish_apks = []
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-
-        for apk in os.listdir(output_folder):
-            finish_apks.append(apk.replace(".txt", ""))
-
-        all_libs_num = len(libs_list)
-        LOGGER.info("The number of libraries analyzed this time is: %d", all_libs_num)
-
-        coarse_engine = None
-        try:
-            coarse_engine = _init_coarse_engine(lib_dex_folder, lib_groups, LOGGER)
-        except Exception as e:
-            LOGGER.error("[libhunter] coarse index initialization failed, fallback to full scan: %s", e)
-            coarse_engine = None
-
-        global_apk_info_dict = manager.dict()
-        for apk in os.listdir(apk_folder):
-
-            # if apk in finish_apks:
-            #     continue
-
-            print("start analyzing: ", apk)
-            LOGGER.info("Starting analysis: %s", apk)
-            apk_time_start = datetime.datetime.now()
-
-            apk_pickle_path = os.path.join(pickle_dir, apk).replace(".apk", ".pkl")
-            try:
-                if os.path.exists(apk_pickle_path):
-                    with open(apk_pickle_path, 'rb') as file:
-                        apk_obj = pickle.load(file)
-                else:
-                    apk_obj = Apk(apk_folder + "/" + apk, LOGGER)
-                    pickle.dump(apk_obj, open(apk_pickle_path, 'wb'))
-            except Exception as e:
-                LOGGER.error("Error in decompile apk: %s", e)
-                continue
-
-            global_apk_info_dict[apk] = apk_obj
-
-            global_finished_jar_dict = manager.dict()
-
-            matched_groups = set(lib_groups.keys())
-            coarse_metrics = {
-                "coarse_total_groups": len(lib_groups),
-                "coarse_candidate_groups": len(matched_groups),
-                "coarse_prune_ratio": 0.0,
-                "coarse_elapsed_ms": 0,
-                "fallback_triggered": False,
-            }
-            if coarse_engine is not None:
-                matched_groups, coarse_metrics = coarse_engine.select_candidate_groups(apk_obj, lib_groups)
-            _log_coarse_metrics(LOGGER, coarse_metrics)
-
-            detect_libs = []
-            for base_name in matched_groups:
-                detect_libs.extend(lib_groups[base_name])
-
-            process_lib_partial = partial(sub_detect_lib, apk=apk, global_apk_info_dict=global_apk_info_dict,
-                                          global_finished_jar_dict=global_finished_jar_dict,
-                                          global_lib_info_dict=global_lib_info_dict)
-
-            if len(detect_libs) > 0:
-                LOGGER.info(f"[+] 进入细筛组件族: {len(matched_groups)}，版本任务数: {len(detect_libs)}")
-                log_queue3 = manager.Queue()
-                listener3 = Process(target=listener_process, args=(log_queue3,))
-                listener3.start()
-                with Pool(processes=thread_num, initializer=worker_init, initargs=(log_queue3,)) as pool:
-                    list(tqdm(pool.imap(process_lib_partial, detect_libs), total=len(detect_libs), desc=f"Detect {apk}", colour='blue'))
-                    pool.close()
-                    pool.join()
-
-                # Stop the listener
-                log_queue3.put(None)
-                listener3.join()
-
-
-            LOGGER.info("-------------------------------------------------------------------")
-            LOGGER.info("Detailed detection information for all libraries included is as follows:")
-            for lib, infos in global_finished_jar_dict.items():
-                # print(lib, infos)
-                LOGGER.info("%s  :  %f   %f   %f", lib, infos[0],
-                            infos[1], infos[2])
-            LOGGER.info("-------------------------------------------------------------------")
-            # Output apk analysis duration
-            apk_time_end = datetime.datetime.now()
-            apk_time = (apk_time_end - apk_time_start).seconds
-            with open(output_folder + "/" + apk + ".txt", "w", encoding="utf-8") as result:
-                for lib in sorted(global_finished_jar_dict.keys()):
-                    result.write("lib: " + lib + "\n")
-                    result.write("similarity: " + str(global_finished_jar_dict[lib][2]) + "\n\n")
-                result.write("time: " + str(apk_time) + "s")
-
-            LOGGER.info("Current apk analysis time: %d (in seconds)", apk_time)
-            del global_apk_info_dict[apk]
+    if exec_mode == "legacy":
+        setup_logger().info("LH_EXEC_MODE=legacy requested; using stable two-stage pipeline implementation.")
+    return _search_libs_in_app_multiprocess(
+        lib_dex_folder=lib_dex_folder,
+        apk_folder=apk_folder,
+        output_folder=output_folder,
+        processes=processes,
+    )
 
 
 def sub_detect_apk(apk,
