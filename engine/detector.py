@@ -295,14 +295,6 @@ def run_logged_command(
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
-    def _safe_echo(line: str) -> None:
-        try:
-            print(line, flush=True)
-        except UnicodeEncodeError:
-            encoding = (getattr(sys.stdout, "encoding", None) or "utf-8")
-            safe = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
-            print(safe, flush=True)
-
     def _should_echo(line: str) -> bool:
         if not stream_output:
             return False
@@ -311,27 +303,94 @@ def run_logged_command(
     def _on_stdout(line: str) -> None:
         _append(stdout_log, line)
         if _should_echo(line):
-            _safe_echo(line)
+            print(line, flush=True)
 
     def _on_stderr(line: str) -> None:
         _append(stderr_log, line)
         if _should_echo(line):
-            _safe_echo(line)
+            print(line, flush=True)
 
-    result = run_command(
-        cmd,
-        cwd=cwd,
-        timeout=timeout,
-        env=env,
-        # Echo is handled in callbacks so we can filter noisy lines.
-        stream_output=False,
-        raise_on_error=False,
-        on_stdout_line=_on_stdout,
-        on_stderr_line=_on_stderr,
-        heartbeat_timeout=heartbeat_timeout,
-        memory_limit_bytes=memory_limit_bytes,
-    )
-    return result
+    # 使用subprocess直接运行命令，因为run_command不支持回调参数
+    import subprocess
+    import threading
+    import queue
+    
+    stdout_queue = queue.Queue()
+    stderr_queue = queue.Queue()
+    
+    def _read_stream(stream, queue, callback):
+        for line in iter(stream.readline, ''):
+            if line:
+                queue.put(line.rstrip('\n'))
+                callback(line.rstrip('\n'))
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        # 启动读取线程
+        stdout_thread = threading.Thread(
+            target=_read_stream,
+            args=(process.stdout, stdout_queue, _on_stdout)
+        )
+        stderr_thread = threading.Thread(
+            target=_read_stream,
+            args=(process.stderr, stderr_queue, _on_stderr)
+        )
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        # 等待进程完成
+        process.wait(timeout=timeout)
+        return_code = process.returncode
+        
+        # 等待线程完成
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        
+        # 收集剩余输出
+        stdout_lines = []
+        stderr_lines = []
+        while not stdout_queue.empty():
+            stdout_lines.append(stdout_queue.get())
+        while not stderr_queue.empty():
+            stderr_lines.append(stderr_queue.get())
+        
+        return CommandResult(
+            cmd=cmd,
+            returncode=return_code,
+            stdout='\n'.join(stdout_lines),
+            stderr='\n'.join(stderr_lines),
+            hung=False
+        )
+        
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return CommandResult(
+            cmd=cmd,
+            returncode=-1,
+            stdout='',
+            stderr='Process timeout',
+            hung=True
+        )
+    except Exception as e:
+        return CommandResult(
+            cmd=cmd,
+            returncode=-1,
+            stdout='',
+            stderr=f'Process error: {str(e)}',
+            hung=False
+        )
 
 
 def _parse_detection_text(text: str) -> list[dict]:
