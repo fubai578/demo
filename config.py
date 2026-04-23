@@ -23,6 +23,13 @@ CVE_KB_PATH = DATA_DIR / "cve_kb.json"
 # LibHunter global pickle cache directory (prewarm)
 PICKLE_CACHE_DIR = DATA_DIR / "lib_pickle_cache"
 
+# --- 新增：PHunter 缓存与预热配置 ---
+PHUNTER_CACHE_DIR = DATA_DIR / "phunter_soot_cache"
+PHUNTER_CACHE_MODE = os.getenv("PHUNTER_CACHE_MODE", "disk")
+PHUNTER_PREWARM_TIMEOUT = int(os.getenv("PHUNTER_PREWARM_TIMEOUT", "1800"))
+PHUNTER_PREWARM_SOURCE_DEFAULT = os.getenv("PHUNTER_PREWARM_SOURCE_DEFAULT", "cve_kb")
+# ------------------------------------
+
 # TPL feature directories
 LIBHUNTER_TPLS_DEX = DATA_DIR / "tpl_dex"
 LIBHUNTER_TPLS_JAR = DATA_DIR / "tpl_jar"
@@ -78,5 +85,6 @@ def ensure_runtime_dirs() -> None:
         DATA_DIR,
         PATCH_DIR,
         PICKLE_CACHE_DIR,
+        PHUNTER_CACHE_DIR,  # <--- 已将缓存目录加入初始化列表
     ):
         path.mkdir(parents=True, exist_ok=True)
