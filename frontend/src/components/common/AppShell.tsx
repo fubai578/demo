@@ -44,7 +44,6 @@ export function AppShell({ children }: PropsWithChildren): JSX.Element {
               <p className="text-base font-bold tracking-tight text-white bg-gradient-to-r from-emerald-300 to-cyan-300 bg-clip-text text-transparent">
                 Android Security Operations Console
               </p>
-              <p className="text-xs text-slate-400 font-mono">National Cyber Security Competition • First Prize</p>
             </div>
           </div>
 
@@ -82,16 +81,13 @@ export function AppShell({ children }: PropsWithChildren): JSX.Element {
             <div className="flex items-center gap-4 text-xs text-slate-500">
               <div className="flex items-center gap-1.5">
                 <Terminal className="h-3 w-3" />
-                <span className="font-mono">v2.4.1 • Production</span>
+                <span className="font-mono">v2.4.1</span>
               </div>
               <div className="h-3 w-px bg-slate-700"></div>
               <div className="flex items-center gap-1.5">
                 <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
-                <span>WebSocket: Connected</span>
+                <span>WebSocket Connected</span>
               </div>
-            </div>
-            <div className="text-xs text-slate-500">
-              © 2024 National Cyber Security Competition • First Prize Award
             </div>
           </div>
         </div>

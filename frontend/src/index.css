@@ -114,6 +114,33 @@ pre,
   animation: glow-pulse 3s ease-in-out infinite;
 }
 
+/* 进度条动画 */
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes spin-slow {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-shimmer {
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+.animate-spin-slow {
+  animation: spin-slow 3s linear infinite;
+}
+
 /* 终端样式优化 */
 .terminal-font {
   font-family: "IBM Plex Mono", "JetBrains Mono", Consolas, monospace;

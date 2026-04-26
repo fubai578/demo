@@ -3,7 +3,6 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { Panel } from "../components/common/Panel";
-import { StageBadge } from "../components/common/StageBadge";
 import { UploadDropzone } from "../components/upload/UploadDropzone";
 import { useTaskStore } from "../store/taskStore";
 import { formatBytes } from "../utils/format";
@@ -30,18 +29,7 @@ export function NewTaskPage(): JSX.Element {
 
   return (
     <div className="space-y-6">
-      <Panel
-        title="新建扫描任务"
-        right={
-          <div className="inline-flex items-center gap-2">
-            <StageBadge stage={taskStage} />
-          </div>
-        }
-      >
-        <p className="mb-6 text-base leading-8 text-zinc-400">
-          上传 APK 后会自动调用 <code>/api/upload</code> 与 <code>/api/analyze</code>，并跳转到执行监控页。
-        </p>
-
+      <Panel title="新建扫描任务">
         <UploadDropzone file={selectedFile} onFileSelect={setSelectedFile} disabled={uploadState === "PENDING"} />
 
         <div className="mt-6 flex flex-wrap items-center gap-3">

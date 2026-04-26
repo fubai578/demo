@@ -53,17 +53,19 @@ export function UploadDropzone({ file, onFileSelect, disabled = false }: UploadD
       />
 
       <div className="pointer-events-none text-center">
-        <UploadCloud className="mx-auto h-11 w-11 text-cyan-400" />
-        <p className="mt-3 text-base font-semibold text-white">拖拽 APK 或点击选择文件</p>
-        <p className="mt-2 text-sm text-cyan-300/80">保持现有后端协议，无需修改服务端。</p>
+        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-500/20 to-blue-500/20 border border-cyan-500/30">
+          <UploadCloud className="h-8 w-8 text-cyan-400" />
+        </div>
+        <p className="mt-4 text-base font-semibold text-white">拖拽 APK 或点击选择文件</p>
+        <p className="mt-1.5 text-sm text-slate-400">支持 .apk 格式，单个文件上传</p>
 
         {file && (
-          <div className="mx-auto mt-6 max-w-xl rounded-xl border border-emerald-500/30 bg-emerald-500/10 backdrop-blur-sm px-4 py-3 text-left">
+          <div className="mx-auto mt-6 max-w-md rounded-xl border border-emerald-500/30 bg-gradient-to-r from-emerald-500/10 to-emerald-500/5 backdrop-blur-sm px-4 py-3 text-left">
             <p className="inline-flex items-center gap-2 text-sm text-white">
               <FileArchive className="h-4 w-4 text-emerald-400" />
               {file.name}
             </p>
-            <p className="mt-1 text-xs text-emerald-300">{formatBytes(file.size)}</p>
+            <p className="mt-1 text-xs text-emerald-300/80">{formatBytes(file.size)}</p>
           </div>
         )}
       </div>

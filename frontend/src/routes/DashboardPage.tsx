@@ -23,20 +23,14 @@ export function DashboardPage(): JSX.Element {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Panel className="bg-white/5 backdrop-blur-md border border-white/10 rounded-xl shadow-2xl hover:bg-white/10 transition-all duration-300 hover:scale-[1.02] hover:shadow-[0_20px_60px_rgba(6,182,212,0.3)]" title="任务总数" right={<Activity className="h-4 w-4 text-cyan-400" />}>
           <p className="text-3xl font-bold text-cyan-300 font-mono">{historyTaskIds.length}</p>
-          <p className="mt-2 text-xs text-slate-400">含报告与执行中的任务记录</p>
-          <div className="h-px w-full bg-gradient-to-r from-transparent via-cyan-500/30 to-transparent mt-3"></div>
         </Panel>
 
         <Panel className="bg-white/5 backdrop-blur-md border border-white/10 rounded-xl shadow-2xl hover:bg-white/10 transition-all duration-300 hover:scale-[1.02] hover:shadow-[0_20px_60px_rgba(239,68,68,0.3)]" title="漏洞总记录" right={<Shield className="h-4 w-4 text-rose-400" />}>
           <p className="text-3xl font-bold text-rose-400 font-mono">{totalVulns}</p>
-          <p className="mt-2 text-xs text-slate-400">用于答辩展示风险发现能力</p>
-          <div className="h-px w-full bg-gradient-to-r from-transparent via-rose-500/30 to-transparent mt-3"></div>
         </Panel>
 
         <Panel className="bg-white/5 backdrop-blur-md border border-white/10 rounded-xl shadow-2xl hover:bg-white/10 transition-all duration-300 hover:scale-[1.02] hover:shadow-[0_20px_60px_rgba(16,185,129,0.3)]" title="组件识别数" right={<Layers3 className="h-4 w-4 text-emerald-400" />}>
           <p className="text-3xl font-bold text-emerald-400 font-mono">{totalLibraries}</p>
-          <p className="mt-2 text-xs text-slate-400">used_libraries 汇总统计</p>
-          <div className="h-px w-full bg-gradient-to-r from-transparent via-emerald-500/30 to-transparent mt-3"></div>
         </Panel>
 
         <Panel className="bg-white/5 backdrop-blur-md border border-white/10 rounded-xl shadow-2xl hover:bg-white/10 transition-all duration-300 hover:scale-[1.02] hover:shadow-[0_20px_60px_rgba(139,92,246,0.3)]" title="展示入口" right={<BarChart3 className="h-4 w-4 text-violet-400" />}>
@@ -51,9 +45,8 @@ export function DashboardPage(): JSX.Element {
               </div>
             </Link>
           ) : (
-            <p className="text-sm text-slate-500">创建任务后自动生成入口</p>
+            <p className="text-sm text-slate-500">暂无报告</p>
           )}
-          <div className="h-px w-full bg-gradient-to-r from-transparent via-violet-500/30 to-transparent mt-3"></div>
         </Panel>
       </div>
 
@@ -85,9 +78,6 @@ export function DashboardPage(): JSX.Element {
                     <span className="text-sm text-amber-400 font-medium">答辩模式</span>
                     <Zap className="h-3 w-3 text-amber-500 animate-pulse" />
                   </div>
-                  <p className="text-sm text-slate-400 max-w-md">
-                    查看全局任务趋势、高风险CVE排名、组件来源分析等大屏指标
-                  </p>
                 </div>
                 
                 <div className="inline-flex items-center gap-2 text-cyan-400 text-sm font-medium">
@@ -104,44 +94,6 @@ export function DashboardPage(): JSX.Element {
             <div className="absolute -bottom-2 -left-2 h-4 w-4 rounded-full bg-blue-500/30 blur-sm group-hover:bg-blue-500/50 transition-colors"></div>
           </div>
           
-          {/* 功能说明 */}
-          <Panel title="大屏功能说明" className="bg-slate-900/60">
-            <div className="space-y-3">
-              <div className="flex items-start gap-3">
-                <div className="h-6 w-6 rounded-full bg-emerald-500/10 flex items-center justify-center flex-shrink-0">
-                  <div className="h-3 w-3 rounded-full bg-emerald-500"></div>
-                </div>
-                <div>
-                  <div className="text-sm font-medium text-white">实时监控</div>
-                  <div className="text-xs text-slate-400">查看最近7天任务成功率趋势，峰值并发48任务</div>
-                </div>
-              </div>
-              
-              <div className="flex items-start gap-3">
-                <div className="h-6 w-6 rounded-full bg-rose-500/10 flex items-center justify-center flex-shrink-0">
-                  <div className="h-3 w-3 rounded-full bg-rose-500"></div>
-                </div>
-                <div>
-                  <div className="text-sm font-medium text-white">风险预警</div>
-                  <div className="text-xs text-slate-400">展示Log4Shell、Text4Shell等知名高危CVE威胁排名</div>
-                </div>
-              </div>
-              
-              <div className="flex items-start gap-3">
-                <div className="h-6 w-6 rounded-full bg-amber-500/10 flex items-center justify-center flex-shrink-0">
-                  <div className="h-3 w-3 rounded-full bg-amber-500"></div>
-                </div>
-                <div>
-                  <div className="text-sm font-medium text-white">供应链分析</div>
-                  <div className="text-xs text-slate-400">分析500+组件来源分布，评估供应链风险</div>
-                </div>
-              </div>
-            </div>
-          </Panel>
-          
-          <div className="text-xs text-slate-500 text-center">
-            企业级态势感知 • 数据每5分钟自动更新 • 与主流程解耦
-          </div>
         </div>
       </div>
     </div>

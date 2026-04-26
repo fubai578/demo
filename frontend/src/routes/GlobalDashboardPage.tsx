@@ -30,7 +30,7 @@ export function GlobalDashboardPage(): JSX.Element {
           </div>
         </div>
         <div className="text-xs text-slate-400">
-          数据每5分钟自动更新 • 最后更新: 刚刚
+          最后更新: 刚刚
         </div>
       </div>
 
@@ -91,9 +91,6 @@ export function GlobalDashboardPage(): JSX.Element {
               500+ 分析
             </div>
           </div>
-          <div className="text-xs text-slate-400">
-            覆盖 Android 主流依赖库 • 实时供应链风险评估
-          </div>
         </div>
       </div>
 
@@ -127,7 +124,7 @@ export function GlobalDashboardPage(): JSX.Element {
               <h2 className="text-lg font-semibold text-white">高风险 CVE TOP 榜</h2>
             </div>
             <div className="text-sm text-slate-400">
-              CVSS 9.0+ • 实时威胁情报
+              CVSS 9.0+
             </div>
           </div>
           <div className="p-4 bg-slate-900/50 rounded-lg">
@@ -145,7 +142,7 @@ export function GlobalDashboardPage(): JSX.Element {
               <h2 className="text-lg font-semibold text-white">组件来源占比图</h2>
             </div>
             <div className="text-sm text-slate-400">
-              500+ 组件分析 • 供应链风险评估
+              500+ 组件
             </div>
           </div>
           <div className="p-4 bg-slate-900/50 rounded-lg">

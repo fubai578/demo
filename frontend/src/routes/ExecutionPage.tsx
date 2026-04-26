@@ -3,7 +3,7 @@ import { useEffect } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { ExecutionStatusPanel } from "../components/execution/ExecutionStatusPanel";
-import { LogTerminal } from "../components/execution/LogTerminal";
+import { ScanProgress } from "../components/execution/ScanProgress";
 import { Panel } from "../components/common/Panel";
 import { StageBadge } from "../components/common/StageBadge";
 import { useTaskBootstrap } from "../hooks/useTaskBootstrap";
@@ -69,10 +69,6 @@ export function ExecutionPage(): JSX.Element {
               <span className="text-zinc-500">日志条数</span>
               <span className="text-zinc-300">{logs.length}</span>
             </div>
-            <div className="flex items-center justify-between">
-              <span className="text-zinc-500">执行页恢复</span>
-              <span className="text-zinc-300">URL + localStorage</span>
-            </div>
           </div>
         </Panel>
 
@@ -97,8 +93,14 @@ export function ExecutionPage(): JSX.Element {
         </div>
       </div>
 
-      <Panel title="实时终端" className="bg-zinc-900/50">
-        <LogTerminal logs={logs} />
+      <Panel title="扫描进度" className="bg-zinc-900/50">
+        <ScanProgress
+          logs={logs}
+          taskStage={taskStage}
+          wsState={wsState}
+          isPollingFallback={isPollingFallback}
+          errorMessage={errorMessage}
+        />
       </Panel>
     </div>
   );
